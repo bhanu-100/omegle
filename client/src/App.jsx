@@ -16,6 +16,7 @@ function App() {
   const [input, setInput] = useState('');
   const [connected, setConnected] = useState(false);
   const [waiting, setWaiting] = useState(true);
+  const [statusMessage, setStatusMessage] = useState("Looking for a partner...");
 
   const startVideoChat = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -39,6 +40,16 @@ function App() {
     };
   };
 
+  const toggleMic = () => {
+    const audioTrack = localStreamRef.current?.getAudioTracks()[0];
+    if (audioTrack) audioTrack.enabled = !audioTrack.enabled;
+  };
+
+  const toggleCamera = () => {
+    const videoTrack = localStreamRef.current?.getVideoTracks()[0];
+    if (videoTrack) videoTrack.enabled = !videoTrack.enabled;
+  };
+
   useEffect(() => {
     socket.connect();
 
@@ -46,45 +57,43 @@ function App() {
       socket.emit('join');
     });
 
-    const onWaiting = () => {
+    socket.on('waiting', () => {
       setWaiting(true);
-    };
+      setStatusMessage("🕒 Waiting for a partner...");
+    });
 
-    const onPartnerFound = async () => {
+    socket.on('partner-found', async () => {
       setWaiting(false);
       setConnected(true);
       setMessages([]);
+      setStatusMessage("✅ Connected! Say hi 👋");
 
       await startVideoChat();
 
       const offer = await peerConnectionRef.current.createOffer();
       await peerConnectionRef.current.setLocalDescription(offer);
-
       socket.emit('offer', offer);
-    };
+    });
 
-    const onMessage = (data) => {
+    socket.on('message', (data) => {
       setMessages((prev) => [...prev, { sender: 'stranger', text: data }]);
-    };
+    });
 
-    const onPartnerDisconnected = () => {
+    socket.on('partner-disconnected', () => {
       setConnected(false);
+      setWaiting(true);
+      setStatusMessage("❌ Partner disconnected. Looking for a new one...");
       setMessages((prev) => [...prev, { sender: 'system', text: 'Partner disconnected.' }]);
 
-      // Optional: stop video tracks
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => track.stop());
-      }
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
         peerConnectionRef.current = null;
       }
-    };
 
-    socket.on('waiting', onWaiting);
-    socket.on('partner-found', onPartnerFound);
-    socket.on('message', onMessage);
-    socket.on('partner-disconnected', onPartnerDisconnected);
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((track) => track.stop());
+      }
+    });
 
     socket.on('offer', async (offer) => {
       await startVideoChat();
@@ -103,7 +112,7 @@ function App() {
       try {
         await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (error) {
-        console.error('Error adding ICE candidate:', error);
+        console.error('ICE candidate error:', error);
       }
     });
 
@@ -125,28 +134,29 @@ function App() {
       peerConnectionRef.current.close();
       peerConnectionRef.current = null;
     }
+
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((track) => track.stop());
+      localVideoRef.current.srcObject = null;
+      remoteVideoRef.current.srcObject = null;
     }
 
     socket.emit('skip');
     setMessages([]);
     setConnected(false);
     setWaiting(true);
+    setStatusMessage("⏩ Skipped! Searching for a new partner...");
   };
 
   return (
     <div className="app-container">
       <h2>🎥 Omegle Clone - Video & Text Chat</h2>
 
-      {waiting && <p className="status">🕒 Waiting for a partner...</p>}
-      {!connected && !waiting && (
-        <p className="status error">⚠️ Partner disconnected. Waiting to rematch...</p>
-      )}
+      <p className="status">{statusMessage}</p>
 
       <div className="video-container">
         <div>
-          <h4>Your Video</h4>
+          <h4>You</h4>
           <video ref={localVideoRef} autoPlay playsInline muted />
         </div>
         <div>
@@ -155,11 +165,19 @@ function App() {
         </div>
       </div>
 
+      <div className="controls">
+        <button onClick={toggleMic}>🎤 Toggle Mic</button>
+        <button onClick={toggleCamera}>📷 Toggle Camera</button>
+        {connected && (
+          <button className="skip-btn" onClick={handleSkip}>
+            ⏩ Skip
+          </button>
+        )}
+      </div>
+
       <div className="chat-box">
         {messages.map((msg, i) => (
-          <p key={i}>
-            <strong>{msg.sender}:</strong> {msg.text}
-          </p>
+          <p key={i}><strong>{msg.sender}:</strong> {msg.text}</p>
         ))}
       </div>
 
@@ -174,11 +192,6 @@ function App() {
         <button onClick={sendMessage} disabled={!connected}>
           Send
         </button>
-        {connected && (
-          <button className="skip-btn" onClick={handleSkip}>
-            ⏩ Skip
-          </button>
-        )}
       </div>
     </div>
   );
