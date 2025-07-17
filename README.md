@@ -94,10 +94,7 @@ Places both users back in the queue.
 🧑‍💻 Developer
 Bhanu Pratap Singh
 
-Built with ❤️ using MERN + WebRTC
-Instagram: @bhanu_codes
-GitHub: @yourgithub
-
 📄 License
 MIT License © 2025 Bhanu Pratap Singh
+
   
