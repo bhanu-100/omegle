@@ -5,7 +5,7 @@ const { Server } = require('socket.io');
 
 const app = express();
 app.use(cors({
-  origin: 'https://omegle-azure.vercel.app/',  // ✅ Your deployed frontend URL
+  origin: 'https://omegle-pied.vercel.app/',  // ✅ Your deployed frontend URL
   methods: ['GET', 'POST'],
   credentials: true
 }));
@@ -13,7 +13,7 @@ app.use(cors({
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: 'https://omegle-azure.vercel.app/',
+    origin: 'https://omegle-pied.vercel.app/',
     methods: ['GET', 'POST'],
   },
 });
