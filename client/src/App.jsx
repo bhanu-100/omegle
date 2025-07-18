@@ -7,33 +7,50 @@ function App() {
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
+  const iceCandidatesQueue = useRef([]);
 
   const ICE_SERVERS = {
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   };
 
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [cameraEnabled, setCameraEnabled] = useState(true);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [connected, setConnected] = useState(false);
   const [waiting, setWaiting] = useState(true);
   const [statusMessage, setStatusMessage] = useState("Looking for a partner...");
 
+  const applyQueuedCandidates = async () => {
+    for (const candidate of iceCandidatesQueue.current) {
+      try {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error("Error applying queued candidate", err);
+      }
+    }
+    iceCandidatesQueue.current = [];
+  };
+
   const startVideoChat = async () => {
+    if (peerConnectionRef.current) return;
+
     const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     localVideoRef.current.srcObject = stream;
     localStreamRef.current = stream;
 
-    peerConnectionRef.current = new RTCPeerConnection(ICE_SERVERS);
+    const peer = new RTCPeerConnection(ICE_SERVERS);
+    peerConnectionRef.current = peer;
 
     stream.getTracks().forEach((track) => {
-      peerConnectionRef.current.addTrack(track, stream);
+      peer.addTrack(track, stream);
     });
 
-    peerConnectionRef.current.ontrack = (event) => {
+    peer.ontrack = (event) => {
       remoteVideoRef.current.srcObject = event.streams[0];
     };
 
-    peerConnectionRef.current.onicecandidate = (event) => {
+    peer.onicecandidate = (event) => {
       if (event.candidate) {
         socket.emit('ice-candidate', event.candidate);
       }
@@ -41,13 +58,25 @@ function App() {
   };
 
   const toggleMic = () => {
-    const audioTrack = localStreamRef.current?.getAudioTracks()[0];
-    if (audioTrack) audioTrack.enabled = !audioTrack.enabled;
+    const stream = localStreamRef.current;
+    if (!stream) return;
+
+    const audioTrack = stream.getAudioTracks()[0];
+    if (audioTrack) {
+      audioTrack.enabled = !audioTrack.enabled;
+      setMicEnabled(audioTrack.enabled);
+    }
   };
 
   const toggleCamera = () => {
-    const videoTrack = localStreamRef.current?.getVideoTracks()[0];
-    if (videoTrack) videoTrack.enabled = !videoTrack.enabled;
+    const stream = localStreamRef.current;
+    if (!stream) return;
+
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) {
+      videoTrack.enabled = !videoTrack.enabled;
+      setCameraEnabled(videoTrack.enabled);
+    }
   };
 
   useEffect(() => {
@@ -91,33 +120,58 @@ function App() {
       }
 
       if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => track.stop());
+        localStreamRef.current.getTracks().forEach(track => track.stop());
+        localStreamRef.current = null;
       }
+
+      localVideoRef.current.srcObject = null;
+      remoteVideoRef.current.srcObject = null;
     });
 
     socket.on('offer', async (offer) => {
       await startVideoChat();
-      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer));
 
+      if (peerConnectionRef.current.signalingState !== "stable") {
+        console.warn("Connection not stable. Skipping setRemoteDescription");
+        return;
+      }
+
+      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await peerConnectionRef.current.createAnswer();
       await peerConnectionRef.current.setLocalDescription(answer);
       socket.emit('answer', answer);
+
+      await applyQueuedCandidates();
     });
 
     socket.on('answer', async (answer) => {
-      await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+      if (peerConnectionRef.current.signalingState === 'have-local-offer') {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+        await applyQueuedCandidates();
+      } else {
+        console.warn("Ignoring answer, wrong signaling state.");
+      }
     });
 
-    socket.on('ice-candidate', async (candidate) => {
+    socket.on("ice-candidate", async (candidate) => {
       try {
-        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+        if (!candidate || !candidate.candidate) return;
+
+        const iceCandidate = new RTCIceCandidate(candidate);
+
+        if (peerConnectionRef.current?.remoteDescription) {
+          await peerConnectionRef.current.addIceCandidate(iceCandidate);
+        } else {
+          iceCandidatesQueue.current.push(candidate);
+        }
       } catch (error) {
-        console.error('ICE candidate error:', error);
+        console.error("ICE candidate error:", error);
       }
     });
 
     return () => {
       socket.removeAllListeners();
+      if (peerConnectionRef.current) peerConnectionRef.current.close();
     };
   }, []);
 
@@ -151,7 +205,6 @@ function App() {
   return (
     <div className="app-container">
       <h2>🎥 Omegle Clone - Video & Text Chat</h2>
-
       <p className="status">{statusMessage}</p>
 
       <div className="video-container">
@@ -166,8 +219,12 @@ function App() {
       </div>
 
       <div className="controls">
-        <button onClick={toggleMic}>🎤 Toggle Mic</button>
-        <button onClick={toggleCamera}>📷 Toggle Camera</button>
+        <button onClick={toggleMic}>
+          {micEnabled ? "🎤 Mute Mic" : "🔇 Unmute Mic"}
+        </button>
+        <button onClick={toggleCamera}>
+          {cameraEnabled ? "📷 Turn Off Camera" : "📷 Turn On Camera"}
+        </button>
         {connected && (
           <button className="skip-btn" onClick={handleSkip}>
             ⏩ Skip
