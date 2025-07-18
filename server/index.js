@@ -2,10 +2,12 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
+require('dotenv').config();
 
+const CLIENT_URL = process.env.CLIENT_URL
 const app = express();
 app.use(cors({
-  origin: 'https://omegle-pied.vercel.app',  // ✅ Your deployed frontend URL
+  origin: CLIENT_URL,  // ✅ Your deployed frontend URL
   methods: ['GET', 'POST'],
   credentials: true
 }));
@@ -13,7 +15,7 @@ app.use(cors({
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: 'https://omegle-pied.vercel.app',
+    origin: CLIENT_URL,
     methods: ['GET', 'POST'],
   },
 });
