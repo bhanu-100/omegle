@@ -1,6 +1,7 @@
 import { io } from 'socket.io-client';
 
-const socket = io('https://omegle-v3gr.onrender.com', {
+
+const socket = io(import.meta.env.VITE_API_URL, {
   autoConnect: false, // don’t connect automatically
 });
 
