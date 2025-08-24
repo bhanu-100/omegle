@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 .env
+ca.pem
+service.cert
+service.key
 
 # Editor directories and files
 .vscode/*
