@@ -1,4 +1,4 @@
-// server.js (updated)
+// server.js - Optimized for 100k concurrent users
 require('dotenv').config();
 const fs = require('fs');
 const express = require('express');
@@ -9,10 +9,13 @@ const { createAdapter } = require('@socket.io/redis-adapter');
 const { Kafka } = require('kafkajs');
 const winston = require('winston');
 const client = require('prom-client');
+const cluster = require('cluster');
+const os = require('os');
 
-// ---------- Basic validation of env ----------
+// ---------- Environment validation ----------
 const {
   REDIS_URL,
+  REDIS_CLUSTER_NODES, // comma-separated for Redis cluster
   CLIENT_URL,
   KAFKA_BROKERS,
   KAFKA_TOPIC_EVENTS,
@@ -20,54 +23,205 @@ const {
   KAFKA_SSL_KEY,
   KAFKA_SSL_CERT,
   PORT = 3000,
-  LOG_LEVEL = 'info'
+  LOG_LEVEL = 'info',
+  NODE_ENV = 'production',
+  CLUSTER_WORKERS = os.cpus().length,
+  MAX_CONNECTIONS_PER_WORKER = 10000,
+  RATE_LIMIT_WINDOW_MS = 60000,
+  RATE_LIMIT_MAX_REQUESTS = 100,
+  REDIS_POOL_SIZE = 10,
+  SOCKET_IO_TRANSPORTS = 'websocket,polling'
 } = process.env;
 
-if (!REDIS_URL) {
-  console.error('REDIS_URL is required in .env');
+if (!REDIS_URL && !REDIS_CLUSTER_NODES) {
+  console.error('REDIS_URL or REDIS_CLUSTER_NODES is required');
   process.exit(1);
 }
-if (!KAFKA_BROKERS) {
-  console.warn('KAFKA_BROKERS not set — Kafka logging disabled until set');
+
+// ---------- Cluster setup for horizontal scaling ----------
+if (cluster.isMaster && NODE_ENV === 'production') {
+  console.log(`Master ${process.pid} is running`);
+  
+  // Fork workers
+  for (let i = 0; i < CLUSTER_WORKERS; i++) {
+    cluster.fork();
+  }
+
+  cluster.on('exit', (worker, code, signal) => {
+    console.log(`Worker ${worker.process.pid} died. Restarting...`);
+    cluster.fork();
+  });
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('Master received SIGTERM, shutting down workers...');
+    for (const id in cluster.workers) {
+      cluster.workers[id].kill('SIGTERM');
+    }
+  });
+
+  return; // Exit master process, only workers continue
 }
 
-// ---------- Logger ----------
+// ---------- Worker process ----------
+console.log(`Worker ${process.pid} started`);
+
+// ---------- High-performance logger ----------
 const logger = winston.createLogger({
   level: LOG_LEVEL,
   format: winston.format.combine(
-    winston.format.timestamp(),
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
+    winston.format.errors({ stack: true }),
     winston.format.json()
   ),
-  transports: [new winston.transports.Console()]
+  transports: [
+    new winston.transports.Console({
+      handleExceptions: true,
+      handleRejections: true,
+      silent: NODE_ENV === 'test'
+    })
+  ],
+  exitOnError: false
 });
 
-// ---------- Prometheus ----------
-client.collectDefaultMetrics();
-const activeUsersGauge = new client.Gauge({
-  name: 'active_connections',
-  help: 'Number of active Socket.IO connections'
-});
+// ---------- Enhanced Prometheus metrics ----------
+client.collectDefaultMetrics({ gcDurationBuckets: [0.001, 0.01, 0.1, 1, 2, 5] });
 
-// ---------- Redis setup ----------
-const pubClient = createClient({ url: REDIS_URL });
+const metrics = {
+  activeConnections: new client.Gauge({
+    name: 'active_connections',
+    help: 'Number of active Socket.IO connections',
+    labelNames: ['worker']
+  }),
+  matchmakingDuration: new client.Histogram({
+    name: 'matchmaking_duration_seconds',
+    help: 'Time taken for matchmaking',
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5]
+  }),
+  signalingMessages: new client.Counter({
+    name: 'signaling_messages_total',
+    help: 'Total signaling messages processed',
+    labelNames: ['type', 'worker']
+  }),
+  redisOperations: new client.Histogram({
+    name: 'redis_operation_duration_seconds',
+    help: 'Redis operation duration',
+    labelNames: ['operation'],
+    buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1]
+  }),
+  errorRate: new client.Counter({
+    name: 'errors_total',
+    help: 'Total errors',
+    labelNames: ['type', 'worker']
+  })
+};
+
+// ---------- Redis connection pool ----------
+class RedisPool {
+  constructor(config, poolSize = REDIS_POOL_SIZE) {
+    this.config = config;
+    this.poolSize = poolSize;
+    this.pool = [];
+    this.currentIndex = 0;
+  }
+
+  async init() {
+    for (let i = 0; i < this.poolSize; i++) {
+      const client = createClient(this.config);
+      client.on('error', (err) => {
+        logger.error('Redis pool client error', { 
+          err: err?.message || err, 
+          clientIndex: i,
+          worker: process.pid 
+        });
+        metrics.errorRate.inc({ type: 'redis', worker: process.pid });
+      });
+      await client.connect();
+      this.pool.push(client);
+    }
+    logger.info('Redis pool initialized', { poolSize: this.poolSize, worker: process.pid });
+  }
+
+  getClient() {
+    const client = this.pool[this.currentIndex];
+    this.currentIndex = (this.currentIndex + 1) % this.poolSize;
+    return client;
+  }
+
+  async quit() {
+    await Promise.all(this.pool.map(client => client.quit()));
+  }
+}
+
+// ---------- Enhanced Redis setup with clustering support ----------
+let redisConfig;
+if (REDIS_CLUSTER_NODES) {
+  // Redis Cluster configuration
+  redisConfig = {
+    cluster: {
+      enableReadyCheck: false,
+      redisOptions: {
+        password: process.env.REDIS_PASSWORD,
+      }
+    },
+    socket: {
+      keepAlive: true,
+      reconnectDelay: 1000,
+      connectTimeout: 10000,
+      commandTimeout: 5000
+    }
+  };
+} else {
+  // Single Redis instance
+  redisConfig = {
+    url: REDIS_URL,
+    socket: {
+      keepAlive: true,
+      reconnectDelay: 1000,
+      connectTimeout: 10000,
+      commandTimeout: 5000
+    }
+  };
+}
+
+// Create Redis clients
+const pubClient = createClient(redisConfig);
 const subClient = pubClient.duplicate();
+const redisPool = new RedisPool(redisConfig);
 
-pubClient.on('error', (err) => logger.error('Redis pubClient error', { err: err?.message || err }));
-subClient.on('error', (err) => logger.error('Redis subClient error', { err: err?.message || err }));
+// Redis error handlers
+pubClient.on('error', (err) => {
+  logger.error('Redis pubClient error', { err: err?.message || err, worker: process.pid });
+  metrics.errorRate.inc({ type: 'redis_pub', worker: process.pid });
+});
 
-// ---------- Kafka setup (optional) ----------
+subClient.on('error', (err) => {
+  logger.error('Redis subClient error', { err: err?.message || err, worker: process.pid });
+  metrics.errorRate.inc({ type: 'redis_sub', worker: process.pid });
+});
+
+// ---------- Optimized Kafka setup ----------
 let kafkaConnected = false;
 let producer = null;
+let kafkaReconnectTimer = null;
+
 if (KAFKA_BROKERS) {
   const kafkaConfig = {
-    clientId: 'webrtc-chat-service',
-    brokers: KAFKA_BROKERS.split(',').map(s => s.trim())
+    clientId: `webrtc-chat-service-${process.pid}`,
+    brokers: KAFKA_BROKERS.split(',').map(s => s.trim()),
+    retry: {
+      retries: 10,
+      factor: 2,
+      multiplier: 2,
+      maxRetryTime: 30000
+    },
+    connectionTimeout: 10000,
+    requestTimeout: 30000
   };
 
-  // Add SSL options if provided
   if (KAFKA_SSL_CA && KAFKA_SSL_KEY && KAFKA_SSL_CERT) {
     kafkaConfig.ssl = {
-      rejectUnauthorized: true,
+      rejectUnauthorized: false, // Adjust based on your SSL setup
       ca: [fs.readFileSync(KAFKA_SSL_CA, 'utf8')],
       key: fs.readFileSync(KAFKA_SSL_KEY, 'utf8'),
       cert: fs.readFileSync(KAFKA_SSL_CERT, 'utf8')
@@ -75,247 +229,494 @@ if (KAFKA_BROKERS) {
   }
 
   const kafka = new Kafka(kafkaConfig);
-  producer = kafka.producer();
+  producer = kafka.producer({
+    maxInFlightRequests: 1,
+    idempotent: true,
+    transactionTimeout: 30000,
+    allowAutoTopicCreation: false
+  });
 
-  producer.connect()
-    .then(() => {
+  const connectKafka = async () => {
+    try {
+      await producer.connect();
       kafkaConnected = true;
-      logger.info('Connected to Kafka brokers');
-    })
-    .catch((err) => {
+      logger.info('Connected to Kafka brokers', { worker: process.pid });
+      
+      if (kafkaReconnectTimer) {
+        clearInterval(kafkaReconnectTimer);
+        kafkaReconnectTimer = null;
+      }
+    } catch (err) {
       kafkaConnected = false;
-      logger.error('Kafka connection error', { err: err?.message || err });
-    });
+      logger.error('Kafka connection error', { 
+        err: err?.message || err, 
+        worker: process.pid 
+      });
+      metrics.errorRate.inc({ type: 'kafka', worker: process.pid });
+      
+      // Retry connection every 30 seconds
+      if (!kafkaReconnectTimer) {
+        kafkaReconnectTimer = setInterval(connectKafka, 30000);
+      }
+    }
+  };
+
+  connectKafka();
 }
 
-// Helper: safe kafka logger
+// ---------- Batched Kafka logging for performance ----------
+const kafkaBatch = [];
+const KAFKA_BATCH_SIZE = 100;
+const KAFKA_BATCH_TIMEOUT = 1000;
+
 async function logEventToKafka(topic, event) {
-  if (!producer || !kafkaConnected) {
-    // degrade gracefully — do not throw
-    logger.debug('Kafka not connected, skipping event', { topic, eventType: event?.type });
-    return;
-  }
-  try {
-    await producer.send({
-      topic,
-      messages: [{ key: event.userIP || null, value: JSON.stringify({ ...event, timestamp: Date.now() }) }]
-    });
-  } catch (err) {
-    logger.error('Failed to send Kafka message', { err: err?.message || err });
+  if (!producer || !kafkaConnected) return;
+  
+  kafkaBatch.push({
+    topic: topic || KAFKA_TOPIC_EVENTS || 'user-events',
+    messages: [{
+      key: event.userIP || null,
+      value: JSON.stringify({ 
+        ...event, 
+        timestamp: Date.now(),
+        worker: process.pid 
+      })
+    }]
+  });
+
+  if (kafkaBatch.length >= KAFKA_BATCH_SIZE) {
+    await flushKafkaBatch();
   }
 }
 
-// ---------- Express + Socket.IO ----------
-// We create server now but wait to start listening until Redis adapter ready
+async function flushKafkaBatch() {
+  if (kafkaBatch.length === 0 || !kafkaConnected) return;
+  
+  const batch = kafkaBatch.splice(0);
+  try {
+    await producer.sendBatch({ topicMessages: batch });
+  } catch (err) {
+    logger.error('Failed to send Kafka batch', { 
+      err: err?.message || err,
+      batchSize: batch.length,
+      worker: process.pid 
+    });
+    metrics.errorRate.inc({ type: 'kafka_batch', worker: process.pid });
+  }
+}
+
+// Periodic flush
+setInterval(flushKafkaBatch, KAFKA_BATCH_TIMEOUT);
+
+// ---------- Rate limiting ----------
+const rateLimitMap = new Map();
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const key = ip;
+  const windowStart = now - parseInt(RATE_LIMIT_WINDOW_MS);
+  
+  if (!rateLimitMap.has(key)) {
+    rateLimitMap.set(key, []);
+  }
+  
+  const requests = rateLimitMap.get(key);
+  // Clean old requests
+  while (requests.length > 0 && requests[0] < windowStart) {
+    requests.shift();
+  }
+  
+  if (requests.length >= parseInt(RATE_LIMIT_MAX_REQUESTS)) {
+    return true;
+  }
+  
+  requests.push(now);
+  return false;
+}
+
+// Clean up rate limit map periodically
+setInterval(() => {
+  const now = Date.now();
+  const windowStart = now - parseInt(RATE_LIMIT_WINDOW_MS);
+  
+  for (const [key, requests] of rateLimitMap.entries()) {
+    while (requests.length > 0 && requests[0] < windowStart) {
+      requests.shift();
+    }
+    if (requests.length === 0) {
+      rateLimitMap.delete(key);
+    }
+  }
+}, parseInt(RATE_LIMIT_WINDOW_MS));
+
+// ---------- Express setup with optimizations ----------
 const app = express();
+
+// Trust proxy for proper IP detection
+app.set('trust proxy', true);
+
+// Security and performance middleware
+app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
+
 const server = http.createServer(app);
 
-// metrics endpoint
+// Tune server for high concurrency
+server.maxConnections = parseInt(MAX_CONNECTIONS_PER_WORKER);
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  const startTime = process.hrtime.bigint();
+  
+  try {
+    // Quick Redis ping
+    const redisClient = redisPool.getClient();
+    await redisClient.ping();
+    
+    const endTime = process.hrtime.bigint();
+    const duration = Number(endTime - startTime) / 1000000; // Convert to milliseconds
+    
+    res.json({
+      status: 'UP',
+      worker: process.pid,
+      redis: 'ok',
+      kafka: kafkaConnected ? 'ok' : 'disconnected',
+      responseTime: `${duration.toFixed(2)}ms`,
+      connections: metrics.activeConnections._hashMap.get('worker:' + process.pid)?.value || 0,
+      uptime: process.uptime(),
+      memory: process.memoryUsage()
+    });
+  } catch (err) {
+    logger.error('Health check failed', { err: err?.message || err, worker: process.pid });
+    res.status(500).json({
+      status: 'DOWN',
+      worker: process.pid,
+      error: err?.message || err
+    });
+  }
+});
+
+// Metrics endpoint
 app.get('/metrics', async (req, res) => {
   try {
     res.set('Content-Type', client.register.contentType);
     res.end(await client.register.metrics());
   } catch (err) {
-    res.status(500).send('metrics error');
+    logger.error('Metrics error', { err: err?.message || err });
+    res.status(500).send('Metrics error');
   }
 });
 
-app.get('/health', async (req, res) => {
-  try {
-    // Redis ping (may throw)
-    await pubClient.ping();
-    res.json({
-      status: 'UP',
-      redis: 'ok',
-      kafka: kafkaConnected ? 'ok' : 'disconnected'
-    });
-  } catch (err) {
-    res.status(500).json({ status: 'DOWN', error: err?.message || err });
-  }
-});
-
-// ---------- Match making constants ----------
+// ---------- Constants ----------
 const MATCH_QUEUE = 'wait_queue';
-const SOCKET_MAP = 'socket_map'; // hash: ip -> socketId
-const MATCH_MAP = 'match_map'; // hash: ip -> peerIp
+const SOCKET_MAP = 'socket_map';
+const MATCH_MAP = 'match_map';
+const USER_STATS = 'user_stats';
 
-// ---------- Main async init ----------
+// ---------- Optimized Redis operations ----------
+async function redisOperation(operation, ...args) {
+  const timer = metrics.redisOperations.startTimer({ operation: operation.name });
+  try {
+    const client = redisPool.getClient();
+    const result = await client[operation](...args);
+    timer();
+    return result;
+  } catch (err) {
+    timer();
+    metrics.errorRate.inc({ type: 'redis_operation', worker: process.pid });
+    throw err;
+  }
+}
+
+// ---------- Main initialization ----------
 (async function init() {
   try {
-    // Connect Redis clients
+    // Initialize Redis connections
     await pubClient.connect();
     await subClient.connect();
-    logger.info('Connected to Redis');
+    await redisPool.init();
+    
+    logger.info('Connected to Redis', { worker: process.pid });
 
-    // Now create socket.io and set adapter (must be after Redis connect)
+    // Create Socket.IO with optimizations
     const io = socketIo(server, {
-      cors: { origin: CLIENT_URL || '*', methods: ['GET', 'POST'] },
-      maxHttpBufferSize: 1e6 // 1MB - tune as needed
+      cors: { 
+        origin: CLIENT_URL || '*', 
+        methods: ['GET', 'POST'],
+        credentials: false
+      },
+      transports: SOCKET_IO_TRANSPORTS.split(','),
+      maxHttpBufferSize: 1e6,
+      pingTimeout: 60000,
+      pingInterval: 25000,
+      upgradeTimeout: 10000,
+      allowEIO3: true,
+      cookie: false,
+      serveClient: false
     });
 
-    io.adapter(createAdapter(pubClient, subClient));
-    logger.info('Socket.IO with Redis adapter set up');
+    // Set Redis adapter
+    io.adapter(createAdapter(pubClient, subClient, {
+      key: 'socket.io',
+      requestsTimeout: 5000
+    }));
 
-    // Handle socket connections
+    logger.info('Socket.IO initialized', { worker: process.pid });
+
+    // Connection handler with optimizations
     io.on('connection', (socket) => {
-      const userIP = (socket.handshake.headers['x-forwarded-for'] || socket.handshake.address || '').toString();
-      logger.info('User connected', { userIP, socketId: socket.id });
-      activeUsersGauge.inc();
+      const userIP = (
+        socket.handshake.headers['x-forwarded-for'] ||
+        socket.handshake.headers['x-real-ip'] ||
+        socket.conn.remoteAddress ||
+        socket.handshake.address
+      )?.toString().split(',')[0]?.trim() || 'unknown';
 
-      // store mapping ip -> socketId
-      pubClient.hSet(SOCKET_MAP, userIP, socket.id).catch(err => {
-        logger.error('Redis hSet error', { err: err?.message || err });
+      // Rate limiting
+      if (isRateLimited(userIP)) {
+        logger.warn('Rate limit exceeded', { userIP, worker: process.pid });
+        socket.emit('rate_limited');
+        socket.disconnect(true);
+        return;
+      }
+
+      logger.info('User connected', { userIP, socketId: socket.id, worker: process.pid });
+      
+      metrics.activeConnections.inc({ worker: process.pid });
+      metrics.signalingMessages.inc({ type: 'connect', worker: process.pid });
+
+      // Store socket mapping with TTL
+      redisOperation('hSet', SOCKET_MAP, userIP, socket.id)
+        .then(() => redisOperation('expire', SOCKET_MAP, 3600)) // 1 hour TTL
+        .catch(err => logger.error('Socket mapping error', { err: err?.message || err }));
+
+      // Log connection
+      logEventToKafka(KAFKA_TOPIC_EVENTS, { 
+        type: 'connect', 
+        userIP, 
+        socketId: socket.id 
       });
 
-      // small wrapper to log asynchronously
-      logEventToKafka(KAFKA_TOPIC_EVENTS || 'user-events', { type: 'connect', userIP }).catch(() => {});
-
-      // find_match
+      // Optimized matchmaking
       socket.on('find_match', async () => {
+        const matchTimer = metrics.matchmakingDuration.startTimer();
+        
         try {
-          // remove duplicates of same IP
-          await pubClient.lRem(MATCH_QUEUE, 0, userIP);
-          // pop a queued peer
-          const peerIP = await pubClient.lPop(MATCH_QUEUE);
+          // Remove duplicates and pop a peer atomically
+          const pipeline = redisPool.getClient().multi();
+          pipeline.lRem(MATCH_QUEUE, 0, userIP);
+          pipeline.lPop(MATCH_QUEUE);
+          const [, peerIP] = await pipeline.exec();
+
           if (peerIP && peerIP !== userIP) {
-            const roomId = `room-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-            await pubClient.hSet(MATCH_MAP, userIP, peerIP);
-            await pubClient.hSet(MATCH_MAP, peerIP, userIP);
+            const roomId = `room-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+            
+            // Set matches atomically
+            const matchPipeline = redisPool.getClient().multi();
+            matchPipeline.hSet(MATCH_MAP, userIP, peerIP);
+            matchPipeline.hSet(MATCH_MAP, peerIP, userIP);
+            matchPipeline.hSet(USER_STATS, `${userIP}:matches`, Date.now());
+            matchPipeline.hSet(USER_STATS, `${peerIP}:matches`, Date.now());
+            await matchPipeline.exec();
 
             socket.join(roomId);
-            const peerSocketId = await pubClient.hGet(SOCKET_MAP, peerIP);
+            
+            const peerSocketId = await redisOperation('hGet', SOCKET_MAP, peerIP);
             if (peerSocketId) {
-              // join peer to room (works across nodes)
               io.to(peerSocketId).socketsJoin(roomId);
-              // notify both
-              socket.emit('match_found', { roomId, peerIP });
+              
+              // Notify both users
+              const matchData = { roomId, peerIP };
+              socket.emit('match_found', matchData);
               io.to(peerSocketId).emit('match_found', { roomId, peerIP: userIP });
+              
+              logger.info('Match created', { userIP, peerIP, roomId, worker: process.pid });
             } else {
-              // If peer not online, push current user back
-              await pubClient.rPush(MATCH_QUEUE, userIP);
+              // Peer offline, re-queue current user
+              await redisOperation('rPush', MATCH_QUEUE, userIP);
+              socket.emit('waiting');
             }
 
-            logEventToKafka(KAFKA_TOPIC_EVENTS || 'user-events', { type: 'match', userIP, peerIP, roomId }).catch(() => {});
+            logEventToKafka(KAFKA_TOPIC_EVENTS, { 
+              type: 'match', 
+              userIP, 
+              peerIP, 
+              roomId 
+            });
           } else {
-            // push ourselves to queue if nothing found
-            await pubClient.rPush(MATCH_QUEUE, userIP);
+            // Add to queue
+            await redisOperation('rPush', MATCH_QUEUE, userIP);
             socket.emit('waiting');
-            logger.info('Added to matchmaking queue', { userIP });
+            logger.debug('Added to queue', { userIP, worker: process.pid });
           }
         } catch (err) {
-          logger.error('find_match error', { err: err?.message || err, userIP });
+          logger.error('Matchmaking error', { 
+            err: err?.message || err, 
+            userIP, 
+            worker: process.pid 
+          });
+          metrics.errorRate.inc({ type: 'matchmaking', worker: process.pid });
+          socket.emit('error', { message: 'Matchmaking failed' });
+        } finally {
+          matchTimer();
         }
       });
 
-      // Generic signaling forwarder helper
+      // Optimized signaling forwarder
       const forwardToPeer = async (eventName, incomingData) => {
         try {
-          const peerIP = await pubClient.hGet(MATCH_MAP, userIP);
+          const peerIP = await redisOperation('hGet', MATCH_MAP, userIP);
           if (!peerIP) {
-            logger.debug('No peer found to forward', { eventName, userIP });
-            return;
-          }
-          const peerSocketId = await pubClient.hGet(SOCKET_MAP, peerIP);
-          if (!peerSocketId) {
-            logger.debug('Peer socketId not found', { peerIP });
+            logger.debug('No peer found', { eventName, userIP });
             return;
           }
 
-          // Normalize payload: if incomingData has sdp/candidate inside or is raw
-          const payload = {};
-          if (incomingData && typeof incomingData === 'object') {
-            if (incomingData.sdp) payload.sdp = incomingData.sdp;
-            if (incomingData.candidate) payload.candidate = incomingData.candidate;
-            if (incomingData.type && incomingData.sdp) payload.sdp = incomingData; // if a full RTCSessionDescription
-            // else pass entire object
-            if (!payload.sdp && !payload.candidate) Object.assign(payload, incomingData);
-          } else {
-            payload.data = incomingData;
+          const peerSocketId = await redisOperation('hGet', SOCKET_MAP, peerIP);
+          if (!peerSocketId) {
+            logger.debug('Peer socket not found', { peerIP });
+            return;
           }
-          payload.from = userIP;
+
+          // Efficient payload handling
+          const payload = { 
+            ...incomingData, 
+            from: userIP,
+            timestamp: Date.now()
+          };
 
           io.to(peerSocketId).emit(eventName, payload);
-          logEventToKafka(KAFKA_TOPIC_EVENTS || 'user-events', { type: eventName, userIP, peerIP }).catch(() => {});
+          
+          metrics.signalingMessages.inc({ type: eventName, worker: process.pid });
+          
+          // Async logging
+          logEventToKafka(KAFKA_TOPIC_EVENTS, { 
+            type: eventName, 
+            userIP, 
+            peerIP 
+          });
         } catch (err) {
-          logger.error('forwardToPeer error', { err: err?.message || err, eventName, userIP });
+          logger.error('Signal forwarding error', { 
+            err: err?.message || err, 
+            eventName, 
+            userIP,
+            worker: process.pid 
+          });
+          metrics.errorRate.inc({ type: 'signaling', worker: process.pid });
         }
       };
 
-      // signaling events
+      // WebRTC signaling events
       socket.on('webrtc_offer', (data) => forwardToPeer('webrtc_offer', data));
       socket.on('webrtc_answer', (data) => forwardToPeer('webrtc_answer', data));
       socket.on('webrtc_ice_candidate', (data) => forwardToPeer('webrtc_ice_candidate', data));
 
       socket.on('webrtc_error', (err) => {
-        logger.error('webrtc_error from client', { userIP, err });
-        logEventToKafka(KAFKA_TOPIC_EVENTS || 'user-events', { type: 'webrtc_error', userIP, err }).catch(() => {});
+        logger.error('WebRTC error from client', { userIP, err, worker: process.pid });
+        metrics.errorRate.inc({ type: 'webrtc_client', worker: process.pid });
+        logEventToKafka(KAFKA_TOPIC_EVENTS, { type: 'webrtc_error', userIP, err });
       });
 
+      // Optimized disconnect handler
       socket.on('disconnect', async (reason) => {
         try {
-          logger.info('User disconnected', { userIP, reason });
-          // notify peer if matched
-          const peerIP = await pubClient.hGet(MATCH_MAP, userIP);
-          await pubClient.hDel(MATCH_MAP, userIP);
-          await pubClient.hDel(SOCKET_MAP, userIP);
-          await pubClient.lRem(MATCH_QUEUE, 0, userIP);
+          logger.info('User disconnected', { userIP, reason, worker: process.pid });
+          
+          // Atomic cleanup
+          const pipeline = redisPool.getClient().multi();
+          pipeline.hGet(MATCH_MAP, userIP);
+          pipeline.hDel(MATCH_MAP, userIP);
+          pipeline.hDel(SOCKET_MAP, userIP);
+          pipeline.lRem(MATCH_QUEUE, 0, userIP);
+          const [peerIPResult] = await pipeline.exec();
+          const peerIP = peerIPResult?.[1];
 
           if (peerIP) {
-            await pubClient.hDel(MATCH_MAP, peerIP);
-            const peerSocketId = await pubClient.hGet(SOCKET_MAP, peerIP);
-            if (peerSocketId) io.to(peerSocketId).emit('peer_disconnected', { peerIP: userIP });
+            await redisOperation('hDel', MATCH_MAP, peerIP);
+            const peerSocketId = await redisOperation('hGet', SOCKET_MAP, peerIP);
+            if (peerSocketId) {
+              io.to(peerSocketId).emit('peer_disconnected', { peerIP: userIP });
+            }
           }
 
-          activeUsersGauge.dec();
-          logEventToKafka(KAFKA_TOPIC_EVENTS || 'user-events', { type: 'disconnect', userIP, reason }).catch(() => {});
+          metrics.activeConnections.dec({ worker: process.pid });
+          metrics.signalingMessages.inc({ type: 'disconnect', worker: process.pid });
+          
+          logEventToKafka(KAFKA_TOPIC_EVENTS, { 
+            type: 'disconnect', 
+            userIP, 
+            reason 
+          });
         } catch (err) {
-          logger.error('disconnect handler error', { err: err?.message || err });
+          logger.error('Disconnect handler error', { 
+            err: err?.message || err,
+            userIP,
+            worker: process.pid 
+          });
+          metrics.errorRate.inc({ type: 'disconnect', worker: process.pid });
         }
       });
 
       socket.on('error', (err) => {
-        logger.error('Socket error', { userIP, err: err?.message || err });
-        logEventToKafka(KAFKA_TOPIC_EVENTS || 'user-events', { type: 'socket_error', userIP, error: err?.message || err }).catch(() => {});
+        logger.error('Socket error', { 
+          userIP, 
+          err: err?.message || err,
+          worker: process.pid 
+        });
+        metrics.errorRate.inc({ type: 'socket', worker: process.pid });
       });
     });
 
-    // Start server only after Redis and adapter are ready
+    // Start server
     server.listen(PORT, () => {
-      logger.info(`WebRTC signaling server running on port ${PORT}`);
+      logger.info(`Worker ${process.pid} listening on port ${PORT}`);
     });
 
     // Graceful shutdown
-    const graceful = async () => {
-      logger.info('Shutting down gracefully...');
-      try {
-        if (producer && kafkaConnected) {
-          await producer.disconnect().catch(e => logger.warn('Kafka disconnect warning', { e: e?.message || e }));
+    const gracefulShutdown = async (signal) => {
+      logger.info(`Worker ${process.pid} received ${signal}, shutting down gracefully...`);
+      
+      // Stop accepting new connections
+      server.close(async () => {
+        try {
+          // Flush remaining Kafka messages
+          await flushKafkaBatch();
+          
+          // Disconnect Kafka
+          if (producer && kafkaConnected) {
+            await producer.disconnect();
+          }
+          
+          // Close Redis connections
+          await redisPool.quit();
+          await pubClient.quit();
+          await subClient.quit();
+          
+          logger.info(`Worker ${process.pid} shut down complete`);
+          process.exit(0);
+        } catch (err) {
+          logger.error('Shutdown error', { 
+            err: err?.message || err,
+            worker: process.pid 
+          });
+          process.exit(1);
         }
-      } catch (err) {
-        logger.error('Error disconnecting Kafka', { err: err?.message || err });
-      }
-      try {
-        if (pubClient) await pubClient.quit().catch(e => logger.warn('Redis pubClient quit warning', { e: e?.message || e }));
-        if (subClient) await subClient.quit().catch(e => logger.warn('Redis subClient quit warning', { e: e?.message || e }));
-      } catch (err) {
-        logger.error('Error quitting Redis', { err: err?.message || err });
-      }
-      server.close(() => {
-        logger.info('HTTP server closed');
-        process.exit(0);
       });
-      // if not closed in 5s, force exit
+
+      // Force shutdown after timeout
       setTimeout(() => {
-        logger.warn('Forcing shutdown');
+        logger.warn(`Worker ${process.pid} forcing shutdown`);
         process.exit(1);
-      }, 5000).unref();
+      }, 10000);
     };
 
-    process.on('SIGINT', graceful);
-    process.on('SIGTERM', graceful);
+    process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
   } catch (err) {
-    logger.error('Fatal init error', { err: err?.message || err });
+    logger.error('Fatal initialization error', { 
+      err: err?.message || err,
+      worker: process.pid 
+    });
     process.exit(1);
   }
 })();

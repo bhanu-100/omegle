@@ -1,324 +1,1019 @@
-/*
-Corrected frontend files (App.jsx + socket.js) combined in one document for easy copy.
+import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
+import './App.css'; // Import the custom CSS
 
-Files included below:
-- src/socket.js      -> stable socket.io client wrapper (uses VITE_API_URL)
-- src/App.jsx        -> robust React component with WebRTC signaling, queuing, toggles and cleanup
+// Native WebSocket implementation with Socket.IO protocol compatibility
+class SocketIOClient {
+  constructor(url, options = {}) {
+    this.baseUrl = url;
+    this.url = url.replace(/^http/, 'ws') + '/socket.io/?EIO=4&transport=websocket';
+    this.options = options;
+    this.socket = null;
+    this.connected = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = options.reconnectionAttempts || 5;
+    this.reconnectDelay = options.reconnectionDelay || 1000;
+    this.reconnectDelayMax = options.reconnectionDelayMax || 5000;
+    this.listeners = new Map();
+    this.emitQueue = [];
+    this.pingInterval = null;
+    this.pongTimeout = null;
+    this.socketId = null;
+    this.autoConnect = options.autoConnect !== false;
+  }
 
-HOW TO USE
-1. Put socket.js into src/socket.js
-2. Replace your src/App.jsx with the App.jsx section below
-3. Ensure .env has VITE_API_URL = "https://your-backend.example.com" (or http://localhost:3000 for local)
-4. Run `npm run dev` for Vite frontend, and make sure backend is running and accessible.
+  connect() {
+    if (this.socket && this.socket.readyState !== WebSocket.CLOSED) return;
+    
+    try {
+      this.socket = new WebSocket(this.url);
+      
+      this.socket.onopen = () => {
+        console.info('[Socket] Connected via WebSocket');
+        this.connected = true;
+        this.reconnectAttempts = 0;
+        
+        // Send Socket.IO handshake
+        this.socket.send('40'); // Connect packet
+        
+        // Start ping/pong
+        this.startPingPong();
+        
+        // Process queued messages
+        while (this.emitQueue.length > 0) {
+          const { event, payload } = this.emitQueue.shift();
+          this.rawEmit(event, payload);
+        }
+        
+        this.emit('connect');
+      };
+      
+      this.socket.onmessage = (event) => {
+        this.handleMessage(event.data);
+      };
+      
+      this.socket.onclose = (event) => {
+        console.info('[Socket] Disconnected:', event.reason);
+        this.connected = false;
+        this.stopPingPong();
+        
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++;
+          const delay = Math.min(
+            this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
+            this.reconnectDelayMax
+          );
+          console.info(`[Socket] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+          setTimeout(() => this.connect(), delay);
+        }
+        
+        this.emit('disconnect', event.reason);
+      };
+      
+      this.socket.onerror = (error) => {
+        console.warn('[Socket] WebSocket error:', error);
+        this.emit('connect_error', error);
+      };
+      
+    } catch (error) {
+      console.error('[Socket] Failed to create WebSocket:', error);
+      this.emit('connect_error', error);
+    }
+  }
 
-NOTES
-- This code queues emits until socket connects.
-- Signaling payloads are objects { sdp } and { candidate } to match typical server forwarding.
-- ICE candidates are queued on the client until remoteDescription is available.
-- Audio/video toggles now replace senders' tracks where supported so muted streams are not transmitted.
-- Cleanup uses socket.off for each handler instead of removeAllListeners.
-*/
+  handleMessage(data) {
+    // Socket.IO protocol parsing
+    if (data === '3') {
+      // Pong response
+      if (this.pongTimeout) {
+        clearTimeout(this.pongTimeout);
+        this.pongTimeout = null;
+      }
+      return;
+    }
+    
+    if (data.startsWith('40')) {
+      // Connection acknowledgment with socket ID
+      const payload = data.slice(2);
+      if (payload) {
+        try {
+          const connData = JSON.parse(payload);
+          this.socketId = connData.sid || Math.random().toString(36).slice(2);
+        } catch (e) {
+          this.socketId = Math.random().toString(36).slice(2);
+        }
+      }
+      return;
+    }
+    
+    if (data.startsWith('42')) {
+      // Event message
+      try {
+        const payload = JSON.parse(data.slice(2));
+        const [eventName, eventData] = payload;
+        this.emit(eventName, eventData);
+      } catch (err) {
+        console.error('[Socket] Failed to parse message:', data, err);
+      }
+    }
+  }
 
+  startPingPong() {
+    this.pingInterval = setInterval(() => {
+      if (this.connected && this.socket.readyState === WebSocket.OPEN) {
+        this.socket.send('2'); // Ping
+        
+        // Set pong timeout
+        this.pongTimeout = setTimeout(() => {
+          console.warn('[Socket] Pong timeout, reconnecting...');
+          this.socket.close();
+        }, 5000);
+      }
+    }, 25000);
+  }
 
-// =========================
-// src/App.jsx
-// =========================
-import { useEffect, useState, useRef } from 'react';
-import socket from './socket';
-import './App.css';
+  stopPingPong() {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+    if (this.pongTimeout) {
+      clearTimeout(this.pongTimeout);
+      this.pongTimeout = null;
+    }
+  }
+
+  rawEmit(eventName, data = null) {
+    // Regular Socket.IO events
+    const message = data 
+      ? `42${JSON.stringify([eventName, data])}`
+      : `42${JSON.stringify([eventName])}`;
+    
+    if (this.connected && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.send(message);
+    } else {
+      this.emitQueue.push({ event: eventName, payload: data });
+    }
+  }
+
+  emit(eventName, data = null) {
+    if (eventName === 'connect' || eventName === 'disconnect' || eventName === 'connect_error') {
+      // Internal events
+      const handlers = this.listeners.get(eventName) || [];
+      handlers.forEach(handler => {
+        try {
+          handler(data);
+        } catch (err) {
+          console.error('[Socket] Event handler error:', err);
+        }
+      });
+      return;
+    }
+
+    this.rawEmit(eventName, data);
+  }
+
+  on(eventName, handler) {
+    if (!this.listeners.has(eventName)) {
+      this.listeners.set(eventName, []);
+    }
+    this.listeners.get(eventName).push(handler);
+  }
+
+  off(eventName, handler) {
+    if (!this.listeners.has(eventName)) return;
+    
+    const handlers = this.listeners.get(eventName);
+    const index = handlers.indexOf(handler);
+    if (index > -1) {
+      handlers.splice(index, 1);
+    }
+  }
+
+  disconnect() {
+    if (this.socket) {
+      this.socket.close();
+    }
+    this.stopPingPong();
+    this.connected = false;
+  }
+
+  get id() {
+    return this.socketId;
+  }
+}
+
+// Socket factory with interface matching your socket.js
+const createSocket = () => {
+  const BACKEND_URL = typeof window !== 'undefined' && window.location 
+    ? `http://${window.location.hostname}:3000`
+    : 'http://localhost:3000';
+
+  const rawSocket = new SocketIOClient(BACKEND_URL, {
+    autoConnect: false,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+  });
+
+  // Match your socket.js interface exactly
+  return {
+    connect: () => rawSocket.connect(),
+    disconnect: () => rawSocket.disconnect(),
+    on: (ev, cb) => rawSocket.on(ev, cb),
+    off: (ev, cb) => rawSocket.off(ev, cb),
+    emit: (ev, payload) => {
+      if (rawSocket.connected) {
+        return rawSocket.rawEmit(ev, payload);
+      }
+      console.info('[Socket] Not connected yet — queueing emit:', ev);
+      rawSocket.emitQueue.push({ event: ev, payload });
+    },
+    id: () => rawSocket.id,
+    get connected() { return rawSocket.connected; },
+    raw: rawSocket,
+  };
+};
+
+// WebRTC configuration with multiple STUN/TURN servers
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' }
+    // Add TURN servers for production:
+    // { urls: 'turn:your-turn-server.com:3478', username: 'user', credential: 'pass' }
+  ],
+  iceCandidatePoolSize: 10,
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require'
+};
+
+// Media constraints for optimal performance
+const MEDIA_CONSTRAINTS = {
+  video: {
+    width: { min: 320, ideal: 640, max: 1280 },
+    height: { min: 240, ideal: 480, max: 720 },
+    frameRate: { min: 15, ideal: 24, max: 30 },
+    facingMode: 'user'
+  },
+  audio: {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    sampleRate: 44100,
+    channelCount: 1
+  }
+};
+
+// Connection states
+const CONNECTION_STATES = {
+  DISCONNECTED: 'disconnected',
+  CONNECTING: 'connecting',
+  WAITING: 'waiting',
+  CONNECTED: 'connected',
+  ERROR: 'error',
+  RATE_LIMITED: 'rate_limited'
+};
+
+// Message types
+const MESSAGE_TYPES = {
+  USER: 'me',
+  STRANGER: 'stranger',
+  SYSTEM: 'system'
+};
 
 export default function App() {
+  // Refs for media and connections
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const localStreamRef = useRef(null);
-  const iceCandidatesQueue = useRef([]);
+  const iceCandidatesQueueRef = useRef([]);
   const audioSenderRef = useRef(null);
   const videoSenderRef = useRef(null);
+  const socketRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
+  const connectionStatsIntervalRef = useRef(null);
 
-  const ICE_SERVERS = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-
+  // State management
+  const [connectionState, setConnectionState] = useState(CONNECTION_STATES.DISCONNECTED);
   const [micEnabled, setMicEnabled] = useState(true);
   const [cameraEnabled, setCameraEnabled] = useState(true);
   const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [connected, setConnected] = useState(false);
-  const [waiting, setWaiting] = useState(true);
-  const [statusMessage, setStatusMessage] = useState('Looking for a partner...');
+  const [inputMessage, setInputMessage] = useState('');
+  const [statusMessage, setStatusMessage] = useState('Initializing...');
+  const [connectionStats, setConnectionStats] = useState(null);
+  const [error, setError] = useState(null);
+  const [isReconnecting, setIsReconnecting] = useState(false);
 
-  // Apply queued ICE candidates once remoteDescription is set
-  const applyQueuedCandidates = async () => {
-    if (!peerConnectionRef.current) return;
-    for (const c of iceCandidatesQueue.current) {
-      try {
-        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(c));
-      } catch (err) {
-        console.warn('applyQueuedCandidates error', err);
-      }
+  // Performance monitoring
+  const [performanceStats, setPerformanceStats] = useState({
+    packetsLost: 0,
+    bandwidth: { inbound: 0, outbound: 0 },
+    latency: 0,
+    quality: 'good'
+  });
+
+  // Memoized socket instance
+  const socket = useMemo(() => {
+    if (!socketRef.current) {
+      socketRef.current = createSocket();
     }
-    iceCandidatesQueue.current = [];
-  };
+    return socketRef.current;
+  }, []);
 
-  const startVideoChat = async () => {
-    // avoid re-creating
-    if (peerConnectionRef.current) return;
+  // Optimized message handler with batch updates
+  const addMessage = useCallback((sender, text, type = 'text') => {
+    const message = {
+      id: Date.now() + Math.random(),
+      sender,
+      text,
+      type,
+      timestamp: new Date().toLocaleTimeString()
+    };
+    
+    setMessages(prev => {
+      // Limit messages to prevent memory issues
+      const newMessages = [...prev, message];
+      return newMessages.length > 100 ? newMessages.slice(-100) : newMessages;
+    });
+  }, []);
 
-    // request permissions and get media
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    localVideoRef.current.srcObject = stream;
-    localStreamRef.current = stream;
+  // Optimized peer connection creation
+  const createPeerConnection = useCallback(async () => {
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+    }
 
     const pc = new RTCPeerConnection(ICE_SERVERS);
     peerConnectionRef.current = pc;
 
-    // add tracks and keep senders so we can replace tracks when toggling
-    for (const track of stream.getTracks()) {
-      const sender = pc.addTrack(track, stream);
-      if (track.kind === 'audio') audioSenderRef.current = sender;
-      if (track.kind === 'video') videoSenderRef.current = sender;
-    }
-
-    // remote stream handling
-    pc.ontrack = (ev) => {
-      // usually streams[0] contains remote MediaStream
-      remoteVideoRef.current.srcObject = ev.streams[0] || ev.streams && ev.streams[0];
-    };
-
-    // ICE candidates -> server
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) socket.emit('webrtc_ice_candidate', { candidate: ev.candidate });
-    };
-
-    // optional: handle connection state changes for better UX
+    // Connection state monitoring
     pc.onconnectionstatechange = () => {
-      console.info('pc state', pc.connectionState);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        // attempt cleanup
-        // don't automatically rematch here — server will notify peer_disconnected when appropriate
+      console.log('PC Connection State:', pc.connectionState);
+      
+      if (pc.connectionState === 'connected') {
+        setStatusMessage('🔗 WebRTC Connected!');
+        startConnectionMonitoring();
+      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        setStatusMessage('❌ Connection lost. Trying to reconnect...');
+        stopConnectionMonitoring();
       }
     };
+
+    // ICE connection state
+    pc.oniceconnectionstatechange = () => {
+      console.log('ICE Connection State:', pc.iceConnectionState);
+    };
+
+    // Handle remote stream with error handling
+    pc.ontrack = (event) => {
+      try {
+        if (event.streams && event.streams[0]) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+          setStatusMessage('🎥 Video connected!');
+        }
+      } catch (err) {
+        console.error('Error handling remote stream:', err);
+        setError('Failed to display remote video');
+      }
+    };
+
+    // ICE candidate handling with queuing
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        socket.emit('webrtc_ice_candidate', { candidate: event.candidate });
+      }
+    };
+
+    // Add local stream tracks
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        const sender = pc.addTrack(track, localStreamRef.current);
+        if (track.kind === 'audio') audioSenderRef.current = sender;
+        if (track.kind === 'video') videoSenderRef.current = sender;
+      });
+    }
 
     return pc;
-  };
+  }, [socket]);
 
-  const toggleMic = async () => {
-    const stream = localStreamRef.current;
-    if (!stream) return;
-    const audioTrack = stream.getAudioTracks()[0];
-    if (!audioTrack) return;
-
-    // flip local track enabled state
-    audioTrack.enabled = !audioTrack.enabled;
-    setMicEnabled(audioTrack.enabled);
-
-    // replace sender track so remote receives silence if browser supports replaceTrack
+  // Enhanced media acquisition with error handling
+  const acquireMedia = useCallback(async () => {
     try {
+      // Check for media device support
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Media devices not supported');
+      }
+
+      setStatusMessage('📹 Requesting camera and microphone access...');
+      
+      const stream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
+      
+      localStreamRef.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+
+      // Set initial track states
+      const audioTrack = stream.getAudioTracks()[0];
+      const videoTrack = stream.getVideoTracks()[0];
+      
+      if (audioTrack) {
+        audioTrack.enabled = micEnabled;
+        // Monitor audio levels for better UX
+        audioTrack.addEventListener('ended', () => {
+          console.log('Audio track ended');
+          setError('Microphone disconnected');
+        });
+      }
+      
+      if (videoTrack) {
+        videoTrack.enabled = cameraEnabled;
+        videoTrack.addEventListener('ended', () => {
+          console.log('Video track ended');
+          setError('Camera disconnected');
+        });
+      }
+
+      setStatusMessage('✅ Media access granted');
+      return stream;
+    } catch (err) {
+      console.error('Media acquisition error:', err);
+      
+      let errorMessage = 'Failed to access camera/microphone';
+      if (err.name === 'NotAllowedError') {
+        errorMessage = 'Please allow camera and microphone access';
+      } else if (err.name === 'NotFoundError') {
+        errorMessage = 'No camera or microphone found';
+      } else if (err.name === 'NotReadableError') {
+        errorMessage = 'Camera/microphone is being used by another application';
+      }
+      
+      setError(errorMessage);
+      setStatusMessage('❌ ' + errorMessage);
+      throw err;
+    }
+  }, [micEnabled, cameraEnabled]);
+
+  // Connection quality monitoring
+  const startConnectionMonitoring = useCallback(() => {
+    if (connectionStatsIntervalRef.current) return;
+    
+    connectionStatsIntervalRef.current = setInterval(async () => {
+      if (!peerConnectionRef.current) return;
+      
+      try {
+        const stats = await peerConnectionRef.current.getStats();
+        let inboundRtp = null;
+        let outboundRtp = null;
+        
+        stats.forEach(report => {
+          if (report.type === 'inbound-rtp' && report.mediaType === 'video') {
+            inboundRtp = report;
+          }
+          if (report.type === 'outbound-rtp' && report.mediaType === 'video') {
+            outboundRtp = report;
+          }
+        });
+        
+        if (inboundRtp || outboundRtp) {
+          const newStats = {
+            packetsLost: inboundRtp?.packetsLost || 0,
+            bandwidth: {
+              inbound: inboundRtp?.bytesReceived || 0,
+              outbound: outboundRtp?.bytesSent || 0
+            },
+            latency: inboundRtp?.jitter || 0,
+            quality: inboundRtp?.packetsLost > 10 ? 'poor' : 'good'
+          };
+          
+          setPerformanceStats(newStats);
+        }
+      } catch (err) {
+        console.warn('Stats collection error:', err);
+      }
+    }, 2000);
+  }, []);
+
+  const stopConnectionMonitoring = useCallback(() => {
+    if (connectionStatsIntervalRef.current) {
+      clearInterval(connectionStatsIntervalRef.current);
+      connectionStatsIntervalRef.current = null;
+    }
+  }, []);
+
+  // Apply queued ICE candidates
+  const applyQueuedCandidates = useCallback(async () => {
+    if (!peerConnectionRef.current || !peerConnectionRef.current.remoteDescription) return;
+    
+    while (iceCandidatesQueueRef.current.length > 0) {
+      const candidate = iceCandidatesQueueRef.current.shift();
+      try {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.warn('Failed to add ICE candidate:', err);
+      }
+    }
+  }, []);
+
+  // Optimized media controls
+  const toggleMicrophone = useCallback(async () => {
+    try {
+      if (!localStreamRef.current) return;
+      
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (!audioTrack) return;
+      
+      const newState = !micEnabled;
+      audioTrack.enabled = newState;
+      setMicEnabled(newState);
+      
       if (audioSenderRef.current) {
-        // when muted we can replace with null (some browsers accept null), else replace with actual track
-        await audioSenderRef.current.replaceTrack(audioTrack.enabled ? audioTrack : null);
+        await audioSenderRef.current.replaceTrack(newState ? audioTrack : null);
       }
+      
+      addMessage(MESSAGE_TYPES.SYSTEM, `Microphone ${newState ? 'enabled' : 'disabled'}`);
     } catch (err) {
-      console.warn('replaceTrack audio failed', err);
+      console.error('Microphone toggle error:', err);
+      setError('Failed to toggle microphone');
     }
-  };
+  }, [micEnabled, addMessage]);
 
-  const toggleCamera = async () => {
-    const stream = localStreamRef.current;
-    if (!stream) return;
-    const videoTrack = stream.getVideoTracks()[0];
-    if (!videoTrack) return;
-
-    videoTrack.enabled = !videoTrack.enabled;
-    setCameraEnabled(videoTrack.enabled);
-
+  const toggleCamera = useCallback(async () => {
     try {
+      if (!localStreamRef.current) return;
+      
+      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (!videoTrack) return;
+      
+      const newState = !cameraEnabled;
+      videoTrack.enabled = newState;
+      setCameraEnabled(newState);
+      
       if (videoSenderRef.current) {
-        await videoSenderRef.current.replaceTrack(videoTrack.enabled ? videoTrack : null);
+        await videoSenderRef.current.replaceTrack(newState ? videoTrack : null);
       }
+      
+      addMessage(MESSAGE_TYPES.SYSTEM, `Camera ${newState ? 'enabled' : 'disabled'}`);
     } catch (err) {
-      console.warn('replaceTrack video failed', err);
+      console.error('Camera toggle error:', err);
+      setError('Failed to toggle camera');
     }
-  };
+  }, [cameraEnabled, addMessage]);
 
-  useEffect(() => {
-    // connect socket
-    socket.connect();
+  // Socket event handlers
+  const handleSocketConnect = useCallback(() => {
+    console.log('Socket connected');
+    setIsReconnecting(false);
+    setConnectionState(CONNECTION_STATES.WAITING);
+    setStatusMessage('🔍 Looking for a chat partner...');
+    setError(null);
+    
+    // Clear reconnection timeout
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
+    socket.emit('find_match');
+  }, [socket]);
 
-    // Handler functions (named so we can .off them later)
-    const onMatchFound = async ({ roomId, peerIP }) => {
-      setWaiting(false);
-      setConnected(true);
+  const handleSocketDisconnect = useCallback((reason) => {
+    console.log('Socket disconnected:', reason);
+    setConnectionState(CONNECTION_STATES.DISCONNECTED);
+    setStatusMessage('🔌 Connection lost. Reconnecting...');
+    setIsReconnecting(true);
+    stopConnectionMonitoring();
+  }, [stopConnectionMonitoring]);
+
+  const handleMatchFound = useCallback(async ({ roomId, peerIP }) => {
+    try {
+      setConnectionState(CONNECTION_STATES.CONNECTED);
+      setStatusMessage('👋 Partner found! Setting up video...');
       setMessages([]);
-      setStatusMessage('✅ Connected! Say hi 👋');
-
-      await startVideoChat();
-      const offer = await peerConnectionRef.current.createOffer();
-      await peerConnectionRef.current.setLocalDescription(offer);
+      setError(null);
+      
+      await acquireMedia();
+      const pc = await createPeerConnection();
+      
+      // Create and send offer
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true
+      });
+      
+      await pc.setLocalDescription(offer);
       socket.emit('webrtc_offer', { sdp: offer });
-    };
+      
+      addMessage(MESSAGE_TYPES.SYSTEM, 'Connected to partner! Say hello! 👋');
+    } catch (err) {
+      console.error('Match setup error:', err);
+      setError('Failed to connect to partner');
+      handleSkip();
+    }
+  }, [socket, acquireMedia, createPeerConnection, addMessage]);
 
-    const onOffer = async ({ sdp, from }) => {
-      await startVideoChat();
-      // set remote description
+  const handleWebRTCOffer = useCallback(async ({ sdp }) => {
+    try {
+      if (!localStreamRef.current) {
+        await acquireMedia();
+      }
+      
+      if (!peerConnectionRef.current) {
+        await createPeerConnection();
+      }
+      
       await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
+      
       const answer = await peerConnectionRef.current.createAnswer();
       await peerConnectionRef.current.setLocalDescription(answer);
+      
       socket.emit('webrtc_answer', { sdp: answer });
       await applyQueuedCandidates();
-    };
+      
+    } catch (err) {
+      console.error('WebRTC offer handling error:', err);
+      setError('Failed to handle connection offer');
+    }
+  }, [socket, acquireMedia, createPeerConnection, applyQueuedCandidates]);
 
-    const onAnswer = async ({ sdp }) => {
-      // only set if we've created a local offer previously
-      try {
-        if (peerConnectionRef.current && peerConnectionRef.current.signalingState === 'have-local-offer') {
-          await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
-          await applyQueuedCandidates();
-        } else {
-          console.warn('Ignoring answer — not in have-local-offer state');
-        }
-      } catch (err) {
-        console.warn('setRemoteDescription(answer) failed', err);
+  const handleWebRTCAnswer = useCallback(async ({ sdp }) => {
+    try {
+      if (peerConnectionRef.current && peerConnectionRef.current.signalingState === 'have-local-offer') {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(sdp));
+        await applyQueuedCandidates();
       }
-    };
+    } catch (err) {
+      console.error('WebRTC answer handling error:', err);
+      setError('Failed to handle connection answer');
+    }
+  }, [applyQueuedCandidates]);
 
-    const onIceCandidate = async ({ candidate }) => {
-      try {
-        if (!candidate || !candidate.candidate) return;
-        if (peerConnectionRef.current?.remoteDescription?.type) {
-          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
-        } else {
-          iceCandidatesQueue.current.push(candidate);
-        }
-      } catch (err) {
-        console.warn('onIceCandidate error', err);
+  const handleICECandidate = useCallback(async ({ candidate }) => {
+    try {
+      if (!candidate?.candidate) return;
+      
+      if (peerConnectionRef.current?.remoteDescription) {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+      } else {
+        iceCandidatesQueueRef.current.push(candidate);
       }
-    };
+    } catch (err) {
+      console.warn('ICE candidate error:', err);
+    }
+  }, []);
 
-    const onMessage = (data) => setMessages((p) => [...p, { sender: 'stranger', text: data }]);
+  const handlePeerDisconnected = useCallback(() => {
+    setConnectionState(CONNECTION_STATES.WAITING);
+    setStatusMessage('👋 Partner left. Finding new partner...');
+    addMessage(MESSAGE_TYPES.SYSTEM, 'Partner disconnected');
+    
+    cleanup();
+    
+    // Auto-find new match after brief delay
+    setTimeout(() => {
+      if (socket.connected) {
+        socket.emit('find_match');
+      }
+    }, 1000);
+  }, [socket, addMessage]);
 
-    const onPeerDisconnected = () => {
-      setConnected(false);
-      setWaiting(true);
-      setStatusMessage('❌ Partner disconnected. Looking for a new one...');
-      setMessages((p) => [...p, { sender: 'system', text: 'Partner disconnected.' }]);
+  const handleRateLimited = useCallback(() => {
+    setConnectionState(CONNECTION_STATES.RATE_LIMITED);
+    setStatusMessage('⏳ Rate limited. Please wait before trying again...');
+    setError('You are sending requests too quickly. Please wait a moment.');
+    
+    // Auto-retry after delay
+    setTimeout(() => {
+      if (socket.connected) {
+        setConnectionState(CONNECTION_STATES.WAITING);
+        setError(null);
+        socket.emit('find_match');
+      }
+    }, 30000); // 30 second delay
+  }, [socket]);
 
-      peerConnectionRef.current?.close();
+  // Cleanup function
+  const cleanup = useCallback(() => {
+    // Close peer connection
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
       peerConnectionRef.current = null;
+    }
+    
+    // Stop local media
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
+    }
+    
+    // Clear video elements
+    if (localVideoRef.current) localVideoRef.current.srcObject = null;
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    
+    // Clear ICE candidates queue
+    iceCandidatesQueueRef.current = [];
+    
+    // Clear references
+    audioSenderRef.current = null;
+    videoSenderRef.current = null;
+    
+    // Stop monitoring
+    stopConnectionMonitoring();
+  }, [stopConnectionMonitoring]);
 
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-        localStreamRef.current = null;
-      }
+  // Send message with optimization
+  const sendMessage = useCallback(() => {
+    if (!inputMessage.trim() || connectionState !== CONNECTION_STATES.CONNECTED) return;
+    
+    socket.emit('message', inputMessage);
+    addMessage(MESSAGE_TYPES.USER, inputMessage);
+    setInputMessage('');
+  }, [inputMessage, connectionState, socket, addMessage]);
 
-      localVideoRef.current.srcObject = null;
-      remoteVideoRef.current.srcObject = null;
-
-      // re-request a match
-      socket.emit('find_match');
-    };
-
-    const onWaiting = () => {
-      setWaiting(true);
-      setStatusMessage('🕒 Waiting for a partner...');
-    };
-
-    // register
-    socket.on('match_found', onMatchFound);
-    socket.on('webrtc_offer', onOffer);
-    socket.on('webrtc_answer', onAnswer);
-    socket.on('webrtc_ice_candidate', onIceCandidate);
-    socket.on('message', onMessage);
-    socket.on('peer_disconnected', onPeerDisconnected);
-    socket.on('waiting', onWaiting);
-
-    // request matchmaking (safeEmit queues if not connected yet)
+  // Skip current partner
+  const handleSkip = useCallback(() => {
+    cleanup();
+    setMessages([]);
+    setConnectionState(CONNECTION_STATES.WAITING);
+    setStatusMessage('⏭️ Skipped! Finding new partner...');
+    
+    socket.emit('skip');
     socket.emit('find_match');
+  }, [socket, cleanup]);
 
+  // Main effect for socket setup
+  useEffect(() => {
+    // Socket event listeners
+    socket.on('connect', handleSocketConnect);
+    socket.on('disconnect', handleSocketDisconnect);
+    socket.on('match_found', handleMatchFound);
+    socket.on('webrtc_offer', handleWebRTCOffer);
+    socket.on('webrtc_answer', handleWebRTCAnswer);
+    socket.on('webrtc_ice_candidate', handleICECandidate);
+    socket.on('peer_disconnected', handlePeerDisconnected);
+    socket.on('waiting', () => {
+      setConnectionState(CONNECTION_STATES.WAITING);
+      setStatusMessage('🕐 Waiting for partner...');
+    });
+    socket.on('rate_limited', handleRateLimited);
+    socket.on('message', (data) => addMessage(MESSAGE_TYPES.STRANGER, data));
+    socket.on('error', (error) => {
+      console.error('Socket error:', error);
+      setError('Connection error: ' + error.message);
+    });
+
+    // Connect socket
+    socket.connect();
+
+    // Cleanup on unmount
     return () => {
-      // cleanup listeners and close pc
-      socket.off('match_found', onMatchFound);
-      socket.off('webrtc_offer', onOffer);
-      socket.off('webrtc_answer', onAnswer);
-      socket.off('webrtc_ice_candidate', onIceCandidate);
-      socket.off('message', onMessage);
-      socket.off('peer_disconnected', onPeerDisconnected);
-      socket.off('waiting', onWaiting);
-
-      try {
+      socket.off('connect', handleSocketConnect);
+      socket.off('disconnect', handleSocketDisconnect);
+      socket.off('match_found', handleMatchFound);
+      socket.off('webrtc_offer', handleWebRTCOffer);
+      socket.off('webrtc_answer', handleWebRTCAnswer);
+      socket.off('webrtc_ice_candidate', handleICECandidate);
+      socket.off('peer_disconnected', handlePeerDisconnected);
+      socket.off('rate_limited', handleRateLimited);
+      
+      cleanup();
+      
+      if (socket.connected) {
         socket.disconnect();
-      } catch (e) {
-        // already disconnected
       }
-
-      peerConnectionRef.current?.close();
+      
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
     };
   }, []);
 
-  const sendMessage = () => {
-    if (!input.trim()) return;
-    socket.emit('message', input);
-    setMessages((p) => [...p, { sender: 'me', text: input }]);
-    setInput('');
-  };
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyPress = (e) => {
+      if (e.key === 'Enter' && e.target.tagName !== 'INPUT') {
+        e.preventDefault();
+        if (connectionState === CONNECTION_STATES.CONNECTED) {
+          const input = document.querySelector('input[type="text"]');
+          if (input) input.focus();
+        }
+      } else if (e.key === 'Escape') {
+        handleSkip();
+      }
+    };
 
-  const handleSkip = () => {
-    // close peer, stop local devices
-    peerConnectionRef.current?.close();
-    peerConnectionRef.current = null;
-
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
-      localStreamRef.current = null;
-    }
-
-    localVideoRef.current.srcObject = null;
-    remoteVideoRef.current.srcObject = null;
-
-    socket.emit('skip');
-    setMessages([]);
-    setConnected(false);
-    setWaiting(true);
-    setStatusMessage('⏩ Skipped! Searching for a new partner...');
-    socket.emit('find_match');
-  };
+    document.addEventListener('keydown', handleKeyPress);
+    return () => document.removeEventListener('keydown', handleKeyPress);
+  }, [connectionState, handleSkip]);
 
   return (
-    <div className="app-container">
-      <h2>🎥 Omegle Clone - Video & Text Chat</h2>
-      <p className="status">{statusMessage}</p>
+    <div className="min-h-screen bg-gradient-to-br from-purple-900 via-blue-900 to-indigo-900 text-white">
+      <div className="container mx-auto px-4 py-6">
+        {/* Header */}
+        <header className="text-center mb-6">
+          <h1 className="text-4xl font-bold bg-gradient-to-r from-pink-400 to-purple-400 bg-clip-text text-transparent gradient-shift">
+            🎥 WebRTC Video Chat
+          </h1>
+          <p className="text-xl mt-2 text-gray-300">{statusMessage}</p>
+          
+          {error && (
+            <div className="mt-4 p-3 bg-red-500/20 border border-red-500/50 rounded-lg text-red-200 error-shake">
+              ⚠️ {error}
+            </div>
+          )}
+        </header>
 
-      <div className="video-container">
-        <div>
-          <h4>You</h4>
-          <video ref={localVideoRef} autoPlay playsInline muted />
+        {/* Video Container */}
+        <div className="video-grid grid md:grid-cols-2 gap-6 mb-6">
+          <div className="glass-card rounded-xl p-4">
+            <h3 className="text-lg font-semibold mb-2 text-center text-green-400">You</h3>
+            <div className="video-container aspect-video bg-gray-900 rounded-lg overflow-hidden">
+              <video 
+                ref={localVideoRef} 
+                autoPlay 
+                playsInline 
+                muted
+                className="w-full h-full object-cover"
+              />
+              <div className="video-overlay"></div>
+              <div className="status-indicator">
+                <div className={`status-dot ${micEnabled ? 'active bg-green-400' : 'bg-red-400'}`}></div>
+                <div className={`status-dot ${cameraEnabled ? 'active bg-green-400' : 'bg-red-400'}`}></div>
+              </div>
+            </div>
+          </div>
+          
+          <div className="glass-card rounded-xl p-4">
+            <h3 className="text-lg font-semibold mb-2 text-center text-blue-400">Partner</h3>
+            <div className="video-container aspect-video bg-gray-900 rounded-lg overflow-hidden">
+              <video 
+                ref={remoteVideoRef} 
+                autoPlay 
+                playsInline
+                className="w-full h-full object-cover"
+              />
+              <div className="video-overlay"></div>
+              {connectionState !== CONNECTION_STATES.CONNECTED && (
+                <div className="absolute inset-0 flex items-center justify-center text-gray-400">
+                  <div className="text-center">
+                    <div className="text-6xl mb-4 pulse-ring">👤</div>
+                    <p>Waiting for partner...</p>
+                    {isReconnecting && <div className="loading-spinner mt-2"></div>}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
-        <div>
-          <h4>Stranger</h4>
-          <video ref={remoteVideoRef} autoPlay playsInline />
+
+        {/* Controls */}
+        <div className="flex justify-center gap-4 mb-6">
+          <button
+            onClick={toggleMicrophone}
+            className={`control-button px-6 py-3 rounded-lg font-semibold transition-all ${
+              micEnabled 
+                ? 'bg-green-600 hover:bg-green-700 text-white' 
+                : 'bg-red-600 hover:bg-red-700 text-white'
+            }`}
+          >
+            {micEnabled ? '🎤 Mic On' : '🔇 Mic Off'}
+          </button>
+          
+          <button
+            onClick={toggleCamera}
+            className={`control-button px-6 py-3 rounded-lg font-semibold transition-all ${
+              cameraEnabled 
+                ? 'bg-green-600 hover:bg-green-700 text-white' 
+                : 'bg-red-600 hover:bg-red-700 text-white'
+            }`}
+          >
+            {cameraEnabled ? '📷 Cam On' : '📷 Cam Off'}
+          </button>
+          
+          {connectionState === CONNECTION_STATES.CONNECTED && (
+            <button
+              onClick={handleSkip}
+              className="control-button px-6 py-3 bg-orange-600 hover:bg-orange-700 text-white rounded-lg font-semibold transition-all"
+            >
+              ⏭️ Next
+            </button>
+          )}
         </div>
-      </div>
 
-      <div className="controls">
-        <button onClick={toggleMic}>{micEnabled ? '🎤 Mute Mic' : '🔇 Unmute Mic'}</button>
-        <button onClick={toggleCamera}>{cameraEnabled ? '📷 Turn Off Camera' : '📷 Turn On Camera'}</button>
-        {connected && <button className="skip-btn" onClick={handleSkip}>⏩ Skip</button>}
-      </div>
-
-      <div className="chat-box">
-        {messages.map((msg, i) => (
-          <p key={i}><strong>{msg.sender}:</strong> {msg.text}</p>
-        ))}
-      </div>
-
-      <div className="input-group">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
-          disabled={!connected}
-          placeholder="Type a message..."
-        />
-        <button onClick={sendMessage} disabled={!connected}>Send</button>
+        {/* Chat Interface */}
+        <div className="grid md:grid-cols-3 gap-6">
+          <div className="md:col-span-2">
+            <div className="glass-card rounded-xl p-4">
+              <h3 className="text-lg font-semibold mb-4 text-purple-400">Chat Messages</h3>
+              <div className="chat-messages h-64 overflow-y-auto space-y-2 mb-4 p-4 bg-gray-900/50 rounded-lg">
+                {messages.map((msg) => (
+                  <div 
+                    key={msg.id} 
+                    className={`message-enter message-enter-active flex ${
+                      msg.sender === MESSAGE_TYPES.USER ? 'justify-end' : 'justify-start'
+                    }`}
+                  >
+                    <div className={`max-w-xs px-3 py-2 rounded-lg ${
+                      msg.sender === MESSAGE_TYPES.USER 
+                        ? 'bg-purple-600 text-white' 
+                        : msg.sender === MESSAGE_TYPES.SYSTEM 
+                          ? 'bg-gray-600 text-gray-200' 
+                          : 'bg-blue-600 text-white'
+                    }`}>
+                      <div className="text-xs opacity-70 mb-1">
+                        {msg.sender === MESSAGE_TYPES.USER ? 'You' : msg.sender === MESSAGE_TYPES.SYSTEM ? 'System' : 'Partner'}
+                        <span className="ml-2">{msg.timestamp}</span>
+                      </div>
+                      <div>{msg.text}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={inputMessage}
+                  onChange={(e) => setInputMessage(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+                  disabled={connectionState !== CONNECTION_STATES.CONNECTED}
+                  placeholder={connectionState === CONNECTION_STATES.CONNECTED ? "Type a message..." : "Connect to start chatting"}
+                  className="flex-1 px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:border-purple-500 transition-colors"
+                />
+                <button
+                  onClick={sendMessage}
+                  disabled={connectionState !== CONNECTION_STATES.CONNECTED || !inputMessage.trim()}
+                  className="control-button px-6 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-600 text-white rounded-lg font-semibold transition-all"
+                >
+                  Send
+                </button>
+              </div>
+            </div>
+          </div>
+          
+          {/* Connection Stats */}
+          <div className="glass-card rounded-xl p-4">
+            <h3 className="text-lg font-semibold mb-4 text-green-400">Connection Info</h3>
+            <div className="space-y-3 text-sm">
+              <div>
+                <span className="text-gray-400">Status:</span>
+                <span className={`ml-2 font-semibold ${
+                  connectionState === CONNECTION_STATES.CONNECTED ? 'text-green-400' : 
+                  connectionState === CONNECTION_STATES.WAITING ? 'text-yellow-400' : 
+                  'text-red-400'
+                }`}>
+                  {connectionState.charAt(0).toUpperCase() + connectionState.slice(1)}
+                </span>
+              </div>
+              
+              {connectionState === CONNECTION_STATES.CONNECTED && (
+                <>
+                  <div>
+                    <span className="text-gray-400">Quality:</span>
+                    <div className="quality-indicator ml-2">
+                      <span className={`font-semibold ${
+                        performanceStats.quality === 'good' ? 'text-green-400' : 'text-red-400'
+                      }`}>
+                        {performanceStats.quality.charAt(0).toUpperCase() + performanceStats.quality.slice(1)}
+                      </span>
+                      <div className="flex gap-1 ml-2">
+                        {[1, 2, 3, 4].map(i => (
+                          <div 
+                            key={i}
+                            className={`quality-bar ${
+                              performanceStats.quality === 'good' && i <= 4 ? 'active text-green-400' :
+                              performanceStats.quality === 'poor' && i <= 2 ? 'active text-red-400' : ''
+                            }`}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <div>
+                    <span className="text-gray-400">Packets Lost:</span>
+                    <span className="ml-2 text-white">{performanceStats.packetsLost}</span>
+                  </div>
+                </>
+              )}
+              
+              {isReconnecting && (
+                <div className="text-yellow-400">
+                  🔄 Reconnecting...
+                  <div className="loading-spinner ml-2"></div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+        
+        {/* Footer */}
+        <footer className="text-center mt-6 text-gray-400 text-sm">
+          <p>Press Enter to focus chat • Press Escape to skip partner</p>
+        </footer>
       </div>
     </div>
   );
