@@ -116,9 +116,9 @@ const metrics = {
   })
 };
 
-// ---------- Redis connection pool ----------
+// ---------- Updated RedisPool class with better error handling ----------
 class RedisPool {
-  constructor(config, poolSize = REDIS_POOL_SIZE) {
+  constructor(config, poolSize = parseInt(REDIS_POOL_SIZE) || 10) {
     this.config = config;
     this.poolSize = poolSize;
     this.pool = [];
@@ -126,37 +126,81 @@ class RedisPool {
   }
 
   async init() {
+    logger.info('Initializing Redis pool', { poolSize: this.poolSize, worker: process.pid });
+    
     for (let i = 0; i < this.poolSize; i++) {
-      const client = createClient(this.config);
-      client.on('error', (err) => {
-        logger.error('Redis pool client error', { 
-          err: err?.message || err, 
+      try {
+        const client = createClient(this.config);
+        
+        client.on('error', (err) => {
+          logger.error('Redis pool client error', { 
+            err: err?.message || err,
+            code: err?.code,
+            clientIndex: i,
+            worker: process.pid 
+          });
+          metrics.errorRate.inc({ type: 'redis_pool', worker: process.pid });
+        });
+
+        client.on('connect', () => {
+          logger.debug('Redis pool client connected', { clientIndex: i, worker: process.pid });
+        });
+
+        await client.connect();
+        this.pool.push(client);
+        logger.debug('Redis pool client initialized', { clientIndex: i, worker: process.pid });
+      } catch (err) {
+        logger.error('Failed to initialize Redis pool client', { 
+          err: err?.message || err,
           clientIndex: i,
           worker: process.pid 
         });
-        metrics.errorRate.inc({ type: 'redis', worker: process.pid });
-      });
-      await client.connect();
-      this.pool.push(client);
+        throw err;
+      }
     }
-    logger.info('Redis pool initialized', { poolSize: this.poolSize, worker: process.pid });
+    
+    logger.info('Redis pool initialization complete', { 
+      poolSize: this.pool.length, 
+      worker: process.pid 
+    });
   }
 
   getClient() {
+    if (this.pool.length === 0) {
+      throw new Error('Redis pool is empty');
+    }
+    
     const client = this.pool[this.currentIndex];
     this.currentIndex = (this.currentIndex + 1) % this.poolSize;
     return client;
   }
 
   async quit() {
-    await Promise.all(this.pool.map(client => client.quit()));
+    logger.info('Closing Redis pool connections', { worker: process.pid });
+    await Promise.all(this.pool.map(async (client, index) => {
+      try {
+        await client.quit();
+        logger.debug('Redis pool client closed', { clientIndex: index, worker: process.pid });
+      } catch (err) {
+        logger.error('Error closing Redis pool client', { 
+          err: err?.message || err,
+          clientIndex: index,
+          worker: process.pid 
+        });
+      }
+    }));
   }
 }
 
 // ---------- Enhanced Redis setup with clustering support ----------
 let redisConfig;
-if (REDIS_CLUSTER_NODES) {
+if (REDIS_CLUSTER_NODES && REDIS_CLUSTER_NODES.trim() !== '') {
   // Redis Cluster configuration
+  const nodes = REDIS_CLUSTER_NODES.split(',').map(node => {
+    const [host, port] = node.trim().split(':');
+    return { host, port: parseInt(port) };
+  });
+  
   redisConfig = {
     cluster: {
       enableReadyCheck: false,
@@ -171,7 +215,9 @@ if (REDIS_CLUSTER_NODES) {
       commandTimeout: 5000
     }
   };
-} else {
+  
+  logger.info('Using Redis Cluster configuration', { nodes, worker: process.pid });
+} else if (REDIS_URL) {
   // Single Redis instance
   redisConfig = {
     url: REDIS_URL,
@@ -182,6 +228,11 @@ if (REDIS_CLUSTER_NODES) {
       commandTimeout: 5000
     }
   };
+  
+  logger.info('Using Single Redis instance', { url: REDIS_URL.replace(/:([^:@]+)@/, ':****@'), worker: process.pid });
+} else {
+  logger.error('No Redis configuration found. Please set REDIS_URL or REDIS_CLUSTER_NODES');
+  process.exit(1);
 }
 
 // Create Redis clients
@@ -189,15 +240,40 @@ const pubClient = createClient(redisConfig);
 const subClient = pubClient.duplicate();
 const redisPool = new RedisPool(redisConfig);
 
-// Redis error handlers
+// Enhanced Redis error handlers with more context
 pubClient.on('error', (err) => {
-  logger.error('Redis pubClient error', { err: err?.message || err, worker: process.pid });
+  logger.error('Redis pubClient error', { 
+    err: err?.message || err, 
+    code: err?.code,
+    worker: process.pid 
+  });
   metrics.errorRate.inc({ type: 'redis_pub', worker: process.pid });
 });
 
 subClient.on('error', (err) => {
-  logger.error('Redis subClient error', { err: err?.message || err, worker: process.pid });
+  logger.error('Redis subClient error', { 
+    err: err?.message || err,
+    code: err?.code, 
+    worker: process.pid 
+  });
   metrics.errorRate.inc({ type: 'redis_sub', worker: process.pid });
+});
+
+// Add connection event handlers for better debugging
+pubClient.on('connect', () => {
+  logger.info('Redis pubClient connected', { worker: process.pid });
+});
+
+subClient.on('connect', () => {
+  logger.info('Redis subClient connected', { worker: process.pid });
+});
+
+pubClient.on('ready', () => {
+  logger.info('Redis pubClient ready', { worker: process.pid });
+});
+
+subClient.on('ready', () => {
+  logger.info('Redis subClient ready', { worker: process.pid });
 });
 
 // ---------- Optimized Kafka setup ----------
