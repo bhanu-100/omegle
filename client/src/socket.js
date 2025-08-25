@@ -1,16 +1,41 @@
 // =========================
-// src/socket.js
+// src/socket.js - Production Fixed Version
 // =========================
 import { io } from 'socket.io-client';
 
-// Read backend URL from environment variables
-const BACKEND_URL = import.meta.env.VITE_API_URL || 
-                   import.meta.env.VITE_SERVER_URL || 
-                   (typeof window !== 'undefined' 
-                     ? `${window.location.protocol}//${window.location.hostname}:3000`
-                     : 'http://localhost:3000');
+// Smart backend URL resolution with protocol detection
+const getBackendUrl = () => {
+  // Environment variables take precedence
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL;
+  }
+  
+  if (import.meta.env.VITE_SERVER_URL) {
+    return import.meta.env.VITE_SERVER_URL;
+  }
+  
+  // Auto-detect protocol and construct URL
+  if (typeof window !== 'undefined') {
+    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+    const hostname = window.location.hostname;
+    
+    // For Vercel/Netlify production, use same origin with correct protocol
+    if (hostname.includes('.vercel.app') || hostname.includes('.netlify.app')) {
+      return `${protocol}//${hostname}`;
+    }
+    
+    // For development with custom port
+    return `${protocol}//${hostname}:3000`;
+  }
+  
+  // Fallback for server-side rendering
+  return 'http://localhost:3000';
+};
+
+const BACKEND_URL = getBackendUrl();
 
 console.info('[Socket] Backend URL:', BACKEND_URL);
+console.info('[Socket] Protocol detected:', BACKEND_URL.startsWith('https') ? 'HTTPS (will use WSS)' : 'HTTP (will use WS)');
 
 // Create socket instance with production-optimized settings
 const rawSocket = io(BACKEND_URL, {
@@ -36,11 +61,15 @@ const rawSocket = io(BACKEND_URL, {
   // Performance settings
   maxHttpBufferSize: 1e6,   // 1MB buffer
   
+  // CORS and security settings for production
+  withCredentials: false,   // Set to true if you need cookies/auth
+  
   // Query parameters (useful for authentication/routing)
   query: {
-    // Add any query params you need
     timestamp: Date.now(),
-    // userAgent: navigator.userAgent
+    // Add client info for debugging
+    client: 'web',
+    // userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'
   }
 });
 
@@ -58,7 +87,8 @@ const stats = {
   connectTime: null,
   reconnects: 0,
   messagesQueued: 0,
-  messagesSent: 0
+  messagesSent: 0,
+  transportUpgrades: 0
 };
 
 // Enhanced connection handler
@@ -67,17 +97,21 @@ rawSocket.on('connect', () => {
   connecting = false;
   stats.connectTime = Date.now();
   
+  // Log transport info for debugging
+  const transport = rawSocket.io?.engine?.transport?.name;
+  console.info(`[Socket] Connected via ${transport}:`, rawSocket.id);
+  
   if (reconnectAttempt > 0) {
     stats.reconnects++;
     console.info(`[Socket] Reconnected after ${reconnectAttempt} attempts`);
-  } else {
-    console.info('[Socket] Connected:', rawSocket.id);
   }
   
   reconnectAttempt = 0;
   
   // Flush message queue efficiently
   const queueLength = emitQueue.length;
+  let flushedCount = 0;
+  
   while (emitQueue.length > 0) {
     const { event, payload, timestamp } = emitQueue.shift();
     
@@ -89,11 +123,19 @@ rawSocket.on('connect', () => {
     
     rawSocket.emit(event, payload);
     stats.messagesSent++;
+    flushedCount++;
   }
   
-  if (queueLength > 0) {
-    console.info(`[Socket] Flushed ${queueLength} queued messages`);
+  if (flushedCount > 0) {
+    console.info(`[Socket] Flushed ${flushedCount}/${queueLength} queued messages`);
   }
+});
+
+// Transport upgrade handler
+rawSocket.on('upgrade', () => {
+  stats.transportUpgrades++;
+  const newTransport = rawSocket.io?.engine?.transport?.name;
+  console.info(`[Socket] Transport upgraded to: ${newTransport}`);
 });
 
 // Disconnection handler
@@ -120,10 +162,12 @@ rawSocket.on('disconnect', (reason) => {
     case 'transport error':
       console.error('[Socket] Transport error occurred');
       break;
+    default:
+      console.warn(`[Socket] Disconnected with reason: ${reason}`);
   }
 });
 
-// Connection error handler
+// Connection error handler with enhanced debugging
 rawSocket.on('connect_error', (err) => {
   connected = false;
   connecting = false;
@@ -131,13 +175,24 @@ rawSocket.on('connect_error', (err) => {
   
   console.warn(`[Socket] Connection error (attempt ${reconnectAttempt}):`, err.message);
   
-  // Detailed error logging for debugging
+  // Enhanced error diagnosis
   if (err.description) {
     console.warn('[Socket] Error details:', err.description);
   }
   
   if (err.type === 'TransportError') {
     console.warn('[Socket] Transport error - network may be unreliable');
+    
+    // Specific HTTPS/WSS guidance
+    if (err.message.includes('websocket') || err.message.includes('WebSocket')) {
+      console.error('[Socket] WebSocket connection failed. If on HTTPS, ensure server supports WSS');
+    }
+  }
+  
+  // Mixed content error detection
+  if (err.message.includes('Mixed Content') || err.message.includes('insecure')) {
+    console.error('[Socket] SECURITY ERROR: Attempting HTTP connection from HTTPS page');
+    console.error('[Socket] Fix: Update server URL to use HTTPS/WSS');
   }
 });
 
@@ -149,7 +204,13 @@ rawSocket.on('reconnect_attempt', (attemptNumber) => {
 
 rawSocket.on('reconnect_failed', () => {
   console.error('[Socket] Reconnection failed - giving up');
+  console.error('[Socket] Check network connection and server availability');
   connecting = false;
+});
+
+// Production error monitoring
+rawSocket.on('error', (error) => {
+  console.error('[Socket] Socket.IO error:', error);
 });
 
 // Rate limiting detection
@@ -162,13 +223,18 @@ function safeEmit(event, payload) {
   const timestamp = Date.now();
   
   if (connected && rawSocket.connected) {
-    rawSocket.emit(event, payload);
-    stats.messagesSent++;
-    return true;
+    try {
+      rawSocket.emit(event, payload);
+      stats.messagesSent++;
+      return true;
+    } catch (err) {
+      console.error(`[Socket] Emit error for event ${event}:`, err);
+      return false;
+    }
   }
   
   // Don't queue if we're not even trying to connect
-  if (!connecting && !rawSocket.disconnected) {
+  if (!connecting && rawSocket.disconnected) {
     console.warn(`[Socket] Not connected and not connecting - dropping message: ${event}`);
     return false;
   }
@@ -183,7 +249,7 @@ function safeEmit(event, payload) {
   emitQueue.push({ event, payload, timestamp });
   stats.messagesQueued++;
   
-  console.info(`[Socket] Queued message: ${event} (queue size: ${emitQueue.length})`);
+  console.debug(`[Socket] Queued message: ${event} (queue size: ${emitQueue.length})`);
   return false;
 }
 
@@ -195,8 +261,11 @@ function getConnectionHealth() {
     socketId: rawSocket.id,
     transport: rawSocket.io?.engine?.transport?.name,
     queueSize: emitQueue.length,
+    backendUrl: BACKEND_URL,
+    protocol: BACKEND_URL.startsWith('https') ? 'HTTPS/WSS' : 'HTTP/WS',
     stats: { ...stats },
-    ping: rawSocket.ping || null
+    ping: rawSocket.ping || null,
+    readyState: rawSocket.connected ? 'OPEN' : 'CLOSED'
   };
 }
 
@@ -208,16 +277,28 @@ function clearQueue() {
   return cleared;
 }
 
+// Enhanced connection method with retry logic
+function connectWithRetry() {
+  if (connected || connecting) {
+    console.debug('[Socket] Already connected or connecting');
+    return;
+  }
+  
+  connecting = true;
+  console.info('[Socket] Initiating connection to:', BACKEND_URL);
+  
+  try {
+    rawSocket.connect();
+  } catch (err) {
+    console.error('[Socket] Connection initiation failed:', err);
+    connecting = false;
+  }
+}
+
 // Enhanced socket interface with additional utilities
 export default {
   // Core Socket.IO methods
-  connect: () => {
-    if (!connected && !connecting) {
-      connecting = true;
-      console.info('[Socket] Initiating connection...');
-      rawSocket.connect();
-    }
-  },
+  connect: connectWithRetry,
   
   disconnect: () => {
     console.info('[Socket] Disconnecting...');
@@ -252,11 +333,57 @@ export default {
     emit: (event, payload) => {
       // Volatile messages are not queued - they're dropped if not connected
       if (connected && rawSocket.connected) {
-        rawSocket.volatile.emit(event, payload);
-        return true;
+        try {
+          rawSocket.volatile.emit(event, payload);
+          return true;
+        } catch (err) {
+          console.error(`[Socket] Volatile emit error for ${event}:`, err);
+          return false;
+        }
       }
       console.debug(`[Socket] Dropping volatile message: ${event}`);
       return false;
+    }
+  },
+  
+  // Production debugging helpers
+  debug: {
+    getUrl: () => BACKEND_URL,
+    getProtocol: () => BACKEND_URL.startsWith('https') ? 'HTTPS/WSS' : 'HTTP/WS',
+    forceReconnect: () => {
+      console.info('[Socket] Force reconnecting...');
+      rawSocket.disconnect();
+      setTimeout(() => connectWithRetry(), 1000);
+    },
+    testConnection: async () => {
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          resolve({ success: false, error: 'Connection test timeout' });
+        }, 10000);
+        
+        const testHandler = () => {
+          clearTimeout(timeout);
+          rawSocket.off('connect', testHandler);
+          rawSocket.off('connect_error', errorHandler);
+          resolve({ success: true, transport: rawSocket.io?.engine?.transport?.name });
+        };
+        
+        const errorHandler = (err) => {
+          clearTimeout(timeout);
+          rawSocket.off('connect', testHandler);
+          rawSocket.off('connect_error', errorHandler);
+          resolve({ success: false, error: err.message });
+        };
+        
+        rawSocket.on('connect', testHandler);
+        rawSocket.on('connect_error', errorHandler);
+        
+        if (!connected) {
+          connectWithRetry();
+        } else {
+          testHandler();
+        }
+      });
     }
   },
   
@@ -274,15 +401,21 @@ export default {
   }
 };
 
-// Global error handling for debugging
+// Enhanced global debugging for production
 if (typeof window !== 'undefined') {
   window.socketDebug = {
     getHealth: getConnectionHealth,
     getStats: () => stats,
     clearQueue,
+    testConnection: () => {
+      console.log('Backend URL:', BACKEND_URL);
+      console.log('Protocol:', BACKEND_URL.startsWith('https') ? 'HTTPS/WSS' : 'HTTP/WS');
+      console.log('Current State:', getConnectionHealth());
+      return getConnectionHealth();
+    },
     forceReconnect: () => {
       rawSocket.disconnect();
-      setTimeout(() => rawSocket.connect(), 1000);
+      setTimeout(() => connectWithRetry(), 1000);
     }
   };
 }

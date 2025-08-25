@@ -5,7 +5,8 @@ import './App.css'; // Import the custom CSS
 class SocketIOClient {
   constructor(url, options = {}) {
     this.baseUrl = url;
-    this.url = url.replace(/^https/, 'wss') + '/socket.io/?EIO=4&transport=websocket';
+    // FIXED: Proper protocol handling for HTTPS/WSS
+    this.url = this.constructWebSocketUrl(url);
     this.options = options;
     this.socket = null;
     this.connected = false;
@@ -19,6 +20,23 @@ class SocketIOClient {
     this.pongTimeout = null;
     this.socketId = null;
     this.autoConnect = options.autoConnect !== false;
+  }
+
+  // FIXED: Smart WebSocket URL construction
+  constructWebSocketUrl(baseUrl) {
+    // Handle protocol conversion properly
+    let wsUrl;
+    if (baseUrl.startsWith('https://')) {
+      wsUrl = baseUrl.replace('https://', 'wss://');
+    } else if (baseUrl.startsWith('http://')) {
+      wsUrl = baseUrl.replace('http://', 'ws://');
+    } else {
+      // If no protocol specified, detect from current page
+      const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      wsUrl = protocol + baseUrl;
+    }
+    
+    return wsUrl + '/socket.io/?EIO=4&transport=websocket';
   }
 
   connect() {
@@ -203,11 +221,30 @@ class SocketIOClient {
   }
 }
 
-// Socket factory with interface matching your socket.js
+// FIXED: Socket factory with proper URL detection
 const createSocket = () => {
-  const BACKEND_URL = typeof window !== 'undefined' && window.location 
-    ? `http://${window.location.hostname}:3000`
-    : 'http://localhost:3000';
+  // Smart backend URL detection with protocol awareness
+  const getBackendUrl = () => {
+    if (typeof window !== 'undefined' && window.location) {
+      const { protocol, hostname } = window.location;
+      
+      // For production deployments (Vercel, Netlify, etc.)
+      if (hostname.includes('.vercel.app') || hostname.includes('.netlify.app') || hostname.includes('.herokuapp.com')) {
+        // Use same origin with correct protocol (no port needed)
+        return `${protocol}//${hostname}`;
+      }
+      
+      // For development with custom port
+      const backendProtocol = protocol === 'https:' ? 'https:' : 'http:';
+      return `${backendProtocol}//${hostname}:3000`;
+    }
+    
+    // Fallback for SSR
+    return 'http://localhost:3000';
+  };
+
+  const BACKEND_URL = getBackendUrl();
+  console.info('[Socket] Backend URL detected:', BACKEND_URL);
 
   const rawSocket = new SocketIOClient(BACKEND_URL, {
     autoConnect: false,
