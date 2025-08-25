@@ -25,6 +25,7 @@ class SocketIOClient {
     if (this.socket && this.socket.readyState !== WebSocket.CLOSED) return;
     
     try {
+      console.log('[Socket] Attempting to connect to', this.url);
       this.socket = new WebSocket(this.url);
       
       this.socket.onopen = () => {
