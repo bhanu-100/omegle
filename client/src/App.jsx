@@ -5,7 +5,7 @@ import './App.css'; // Import the custom CSS
 class SocketIOClient {
   constructor(url, options = {}) {
     this.baseUrl = url;
-    this.url = url.replace(/^http/, 'ws') + '/socket.io/?EIO=4&transport=websocket';
+    this.url = url.replace(/^https/, 'wss') + '/socket.io/?EIO=4&transport=websocket';
     this.options = options;
     this.socket = null;
     this.connected = false;
@@ -205,7 +205,7 @@ class SocketIOClient {
 // Socket factory with interface matching your socket.js
 const createSocket = () => {
   const BACKEND_URL = typeof window !== 'undefined' && window.location 
-    ? `http://${window.location.hostname}`
+    ? `http://${window.location.hostname}:3000`
     : 'http://localhost:3000';
 
   const rawSocket = new SocketIOClient(BACKEND_URL, {
