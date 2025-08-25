@@ -225,22 +225,9 @@ class SocketIOClient {
 const createSocket = () => {
   // Smart backend URL detection with protocol awareness
   const getBackendUrl = () => {
-    if (typeof window !== 'undefined' && window.location) {
-      const { protocol, hostname } = window.location;
-      
-      // For production deployments (Vercel, Netlify, etc.)
-      if (hostname.includes('.vercel.app') || hostname.includes('.netlify.app') || hostname.includes('.herokuapp.com')) {
-        // Use same origin with correct protocol (no port needed)
-        return `${protocol}//${hostname}`;
-      }
-      
-      // For development with custom port
-      const backendProtocol = protocol === 'https:' ? 'https:' : 'http:';
-      return `${backendProtocol}//${hostname}:3000`;
-    }
     
     // Fallback for SSR
-    return 'http://localhost:3000';
+    return import.meta.env.VITE_API_URL;
   };
 
   const BACKEND_URL = getBackendUrl();
