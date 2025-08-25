@@ -205,7 +205,7 @@ class SocketIOClient {
 // Socket factory with interface matching your socket.js
 const createSocket = () => {
   const BACKEND_URL = typeof window !== 'undefined' && window.location 
-    ? `http://${window.location.hostname}:3000`
+    ? `http://${window.location.hostname}`
     : 'http://localhost:3000';
 
   const rawSocket = new SocketIOClient(BACKEND_URL, {
