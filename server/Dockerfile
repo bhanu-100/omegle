@@ -1,4 +1,5 @@
 # Multi-stage build for WebRTC Chat Service
+
 FROM node:18-alpine AS base
 
 # Install dumb-init for proper signal handling
@@ -44,20 +45,7 @@ EXPOSE 3000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD node -e "
-    const http = require('http');
-    const options = {
-      host: 'localhost',
-      port: process.env.PORT || 3000,
-      path: '/health',
-      timeout: 5000
-    };
-    const req = http.request(options, (res) => {
-      process.exit(res.statusCode === 200 ? 0 : 1);
-    });
-    req.on('error', () => process.exit(1));
-    req.end();
-  "
+    CMD node -e "const http = require('http'); const options = { host: 'localhost', port: process.env.PORT || 3000, path: '/health', timeout: 5000 }; const req = http.request(options, (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }); req.on('error', () => process.exit(1)); req.end();"
 
 # Use dumb-init for proper signal handling
 ENTRYPOINT ["dumb-init", "--"]
@@ -65,15 +53,15 @@ ENTRYPOINT ["dumb-init", "--"]
 # Start the application
 CMD ["node", "src/server.js"]
 
-# Development stage
 FROM dev-dependencies AS development
 
-# Install development dependencies
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && adduser -S webrtc -u 1001
+
 USER root
 COPY --chown=webrtc:nodejs . .
 RUN mkdir -p logs && chown webrtc:nodejs logs
 
 USER webrtc
 
-# Development command
 CMD ["npm", "run", "dev"]
