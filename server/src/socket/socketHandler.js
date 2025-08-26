@@ -72,8 +72,7 @@ class SocketHandler {
     const startTime = Date.now();
     
     // Extract user info
-    const userIP = this.extractUserIP(socket);
-    const userKey = `${userIP}-${socket.id}`;
+    const userKey = socket.id;
     
     // Rate limiting check
     if (connectionService.isRateLimited(userKey)) {
@@ -211,14 +210,6 @@ class SocketHandler {
     }
   }
 
-  extractUserIP(socket) {
-    return (
-      socket.handshake.headers['x-forwarded-for'] ||
-      socket.handshake.headers['x-real-ip'] ||
-      socket.conn.remoteAddress ||
-      socket.handshake.address
-    )?.toString().split(',')[0]?.trim() || 'unknown';
-  }
 
   async shutdown() {
     if (this.io) {
