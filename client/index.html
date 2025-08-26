@@ -2,12 +2,126 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vite + React</title>
+    <meta name="description" content="WebRTC Video Chat - Connect with random people via video chat" />
+    <meta name="keywords" content="video chat, webrtc, random chat, peer to peer" />
+    <meta name="author" content="WebRTC Chat App" />
+    
+    <!-- Security headers -->
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta http-equiv="X-Frame-Options" content="DENY" />
+    <meta http-equiv="X-XSS-Protection" content="1; mode=block" />
+    
+    <!-- PWA Configuration -->
+    <meta name="theme-color" content="#1f2937" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    
+    <!-- Icons -->
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="apple-touch-icon" href="/vite.svg" />
+    
+    <!-- Preconnect to external resources -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="dns-prefetch" href="//stun.l.google.com" />
+    <link rel="dns-prefetch" href="//stun1.l.google.com" />
+    
+    <title>WebRTC Video Chat</title>
+    
+    <!-- Critical CSS for loading state -->
+    <style>
+      #loading-screen {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(135deg, #1f2937 0%, #111827 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        color: white;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+      
+      .spinner {
+        width: 40px;
+        height: 40px;
+        border: 4px solid #374151;
+        border-top: 4px solid #3b82f6;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+        margin-bottom: 16px;
+      }
+      
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      
+      .loading-text {
+        text-align: center;
+        font-size: 18px;
+        margin-top: 16px;
+      }
+      
+      /* Hide loading screen when app loads */
+      .app-loaded #loading-screen {
+        opacity: 0;
+        visibility: hidden;
+        transition: opacity 0.3s ease-out, visibility 0.3s ease-out;
+      }
+    </style>
   </head>
   <body>
+    <!-- Loading screen -->
+    <div id="loading-screen">
+      <div>
+        <div class="spinner"></div>
+        <div class="loading-text">Loading WebRTC Chat...</div>
+      </div>
+    </div>
+    
+    <!-- App root -->
     <div id="root"></div>
+    
+    <!-- Main app script -->
     <script type="module" src="/src/main.jsx"></script>
+    
+    <!-- Service Worker Registration (optional for PWA) -->
+    <script>
+      // Register service worker if available
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js')
+            .then(registration => {
+              console.log('SW registered: ', registration);
+            })
+            .catch(registrationError => {
+              console.log('SW registration failed: ', registrationError);
+            });
+        });
+      }
+      
+      // Hide loading screen when app loads
+      window.addEventListener('load', () => {
+        setTimeout(() => {
+          document.body.classList.add('app-loaded');
+        }, 500);
+      });
+      
+      // Error handling for critical errors
+      window.addEventListener('error', (event) => {
+        console.error('Critical error:', event.error);
+        // You could send this to an error reporting service
+      });
+      
+      window.addEventListener('unhandledrejection', (event) => {
+        console.error('Unhandled promise rejection:', event.reason);
+        // You could send this to an error reporting service
+      });
+    </script>
   </body>
 </html>
