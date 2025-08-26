@@ -27,7 +27,7 @@ class SocketHandler {
       // Initialize Socket.IO
       this.io = socketIo(server, {
         cors: {
-          origin: '*',
+          origin:'*',
           // origin: process.env.CLIENT_URL || '*',
           methods: ['GET', 'POST'],
           credentials: false
@@ -73,10 +73,11 @@ class SocketHandler {
     
     // Extract user info
     const userIP = this.extractUserIP(socket);
+    const userKey = `${userIP}-${socket.id}`;
     
     // Rate limiting check
-    if (connectionService.isRateLimited(userIP)) {
-      logger.warn('Rate limit exceeded', { userIP, worker: process.pid });
+    if (connectionService.isRateLimited(userKey)) {
+      logger.warn('Rate limit exceeded', { userKey, worker: process.pid });
       socket.emit('rate_limited', { message: 'Too many connections' });
       socket.disconnect(true);
       return;
@@ -87,56 +88,56 @@ class SocketHandler {
     metrics.signalingMessages.inc({ type: 'connect', worker: process.pid });
 
     logger.info('User connected', {
-      userIP,
+      userKey,
       socketId: socket.id,
       userAgent: socket.handshake.headers['user-agent'],
       worker: process.pid
     });
 
     // Register connection
-    await connectionService.registerConnection(userIP, socket.id);
+    await connectionService.registerConnection(userKey, socket.id);
     
     // Log connection event
     kafkaService.logEvent('connect', {
-      userIP,
+      userKey,
       socketId: socket.id,
       userAgent: socket.handshake.headers['user-agent'],
       connectionTime: Date.now() - startTime
     });
 
     // Setup event handlers
-    this.setupEventHandlers(socket, userIP);
+    this.setupEventHandlers(socket, userKey);
   }
 
-  setupEventHandlers(socket, userIP) {
+  setupEventHandlers(socket, userKey) {
     // Matchmaking
     socket.on('find_match', async () => {
-      await matchmakingService.findMatch(socket, userIP, this.io);
+      await matchmakingService.findMatch(socket, userKey, this.io);
     });
 
     socket.on('cancel_match', async () => {
-      await matchmakingService.cancelMatch(userIP);
+      await matchmakingService.cancelMatch(userKey);
       socket.emit('match_cancelled');
     });
 
     // WebRTC Signaling
     socket.on('webrtc_offer', async (data) => {
-      await signalingService.forwardSignal(socket, userIP, 'webrtc_offer', data);
+      await signalingService.forwardSignal(socket, userKey, 'webrtc_offer', data);
     });
 
     socket.on('webrtc_answer', async (data) => {
-      await signalingService.forwardSignal(socket, userIP, 'webrtc_answer', data);
+      await signalingService.forwardSignal(socket, userKey, 'webrtc_answer', data);
     });
 
     socket.on('webrtc_ice_candidate', async (data) => {
-      await signalingService.forwardSignal(socket, userIP, 'webrtc_ice_candidate', data);
+      await signalingService.forwardSignal(socket, userKey, 'webrtc_ice_candidate', data);
     });
 
     // Connection quality monitoring
     socket.on('connection_quality', (data) => {
       metrics.connectionQuality.observe(data.rtt || 0);
       kafkaService.logEvent('connection_quality', {
-        userIP,
+        userKey,
         ...data
       });
     });
@@ -144,18 +145,18 @@ class SocketHandler {
     // Error handling
     socket.on('webrtc_error', (error) => {
       logger.error('WebRTC error from client', {
-        userIP,
+        userKey,
         error: error.message || error,
         worker: process.pid
       });
       
       metrics.errorRate.inc({ type: 'webrtc_client', worker: process.pid });
-      kafkaService.logEvent('webrtc_error', { userIP, error });
+      kafkaService.logEvent('webrtc_error', { userKey, error });
     });
 
     socket.on('error', (error) => {
       logger.error('Socket error', {
-        userIP,
+        userKey,
         error: error.message || error,
         worker: process.pid
       });
@@ -165,7 +166,7 @@ class SocketHandler {
 
     // Disconnect handling
     socket.on('disconnect', async (reason) => {
-      await this.handleDisconnect(socket, userIP, reason);
+      await this.handleDisconnect(socket, userKey, reason);
     });
 
     // Heartbeat for connection health
@@ -174,19 +175,19 @@ class SocketHandler {
     });
   }
 
-  async handleDisconnect(socket, userIP, reason) {
+  async handleDisconnect(socket, userKey, reason) {
     try {
       logger.info('User disconnected', {
-        userIP,
+        userKey,
         reason,
         worker: process.pid
       });
 
       // Clean up matchmaking
-      await matchmakingService.handleDisconnect(userIP, this.io);
+      await matchmakingService.handleDisconnect(userKey, this.io);
       
       // Clean up connection
-      await connectionService.handleDisconnect(userIP);
+      await connectionService.handleDisconnect(userKey);
 
       // Update metrics
       metrics.activeConnections.dec({ worker: process.pid });
@@ -194,7 +195,7 @@ class SocketHandler {
 
       // Log disconnect event
       kafkaService.logEvent('disconnect', {
-        userIP,
+        userKey,
         reason,
         sessionDuration: Date.now() - socket.handshake.time
       });
@@ -202,7 +203,7 @@ class SocketHandler {
     } catch (error) {
       logger.error('Error handling disconnect', {
         error: error.message,
-        userIP,
+        userKey,
         worker: process.pid
       });
       
