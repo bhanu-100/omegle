@@ -216,10 +216,9 @@ logger.logSecurityEvent = (event, details = {}) => {
 };
 
 // Connection event logging
-logger.logConnection = (action, userKey, socketId, metadata = {}) => {
+logger.logConnection = (action, socketId, metadata = {}) => {
   logger.info(`Connection ${action}`, {
     action,
-    userKey,
     socketId,
     timestamp: Date.now(),
     ...metadata
@@ -227,11 +226,10 @@ logger.logConnection = (action, userKey, socketId, metadata = {}) => {
 };
 
 // Matchmaking event logging
-logger.logMatchmaking = (action, userKey, peerKey = null, metadata = {}) => {
+logger.logMatchmaking = (action, peerId = null, metadata = {}) => {
   logger.info(`Matchmaking ${action}`, {
     action,
-    userKey,
-    peerKey,
+    peerId,
     timestamp: Date.now(),
     ...metadata
   });

@@ -8,18 +8,19 @@ class ConnectionService {
     this.connections = new Map();
     this.rateLimitMap = new Map();
     this.cleanupInterval = null;
-    
+
     // Rate limiting configuration
     this.rateLimitWindow = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60000;
     this.maxRequestsPerWindow = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 200;
-    
+
     this.startCleanupTimer();
   }
 
-  async registerConnection(userKey, socketId) {
+  // Corrected duplicate parameter names
+  async registerConnection(socketId) {
     try {
       // Store connection info
-      this.connections.set(userKey, {
+      this.connections.set(socketId, {
         socketId,
         connectedAt: Date.now(),
         lastActivity: Date.now(),
@@ -27,74 +28,73 @@ class ConnectionService {
       });
 
       // Store in Redis
-      await redisService.setSocketMapping(userKey, socketId);
+      await redisService.setSocketMapping(socketId, socketId);
 
       // Update connection metrics
       metrics.totalConnections.inc({ worker: process.pid });
-      
-      kafkaService.logConnectionEvent('connection_registered', userKey, socketId, {
+
+      kafkaService.logConnectionEvent('connection_registered', socketId, socketId, {
         timestamp: Date.now()
       });
 
-      logger.debug('Connection registered', { userKey, socketId, worker: process.pid });
+      logger.debug('Connection registered', { socketId, worker: process.pid });
 
     } catch (error) {
       logger.error('Failed to register connection', {
         error: error.message,
-        userKey,
         socketId,
         worker: process.pid
       });
-      
+
       metrics.errorRate.inc({ type: 'connection_registration', worker: process.pid });
       throw error;
     }
   }
 
-  async handleDisconnect(userKey) {
+  async handleDisconnect(socketId) {
     try {
-      const connection = this.connections.get(userKey);
+      const connection = this.connections.get(socketId);
       if (connection) {
         const sessionDuration = Date.now() - connection.connectedAt;
-        
+
         // Update metrics
         metrics.sessionDuration.observe(sessionDuration / 1000);
-        
-        kafkaService.logConnectionEvent('connection_ended', userKey, connection.socketId, {
+
+        kafkaService.logConnectionEvent('connection_ended', socketId, connection.socketId, {
           sessionDuration,
           requestCount: connection.requestCount
         });
 
         // Remove from local storage
-        this.connections.delete(userKey);
+        this.connections.delete(socketId);
       }
 
       // Remove from Redis
-      await redisService.deleteSocketMapping(userKey);
-      
-      logger.debug('Connection cleanup completed', { userKey, worker: process.pid });
+      await redisService.deleteSocketMapping(socketId);
+
+      logger.debug('Connection cleanup completed', { socketId, worker: process.pid });
 
     } catch (error) {
       logger.error('Failed to handle disconnect', {
         error: error.message,
-        userKey,
+        socketId,
         worker: process.pid
       });
-      
+
       metrics.errorRate.inc({ type: 'disconnect_handling', worker: process.pid });
     }
   }
 
-  isRateLimited(userKey) {
+  isRateLimited(socketId) {
     const now = Date.now();
     const windowStart = now - this.rateLimitWindow;
 
-    if (!this.rateLimitMap.has(userKey)) {
-      this.rateLimitMap.set(userKey, []);
+    if (!this.rateLimitMap.has(socketId)) {
+      this.rateLimitMap.set(socketId, []);
     }
 
-    const requests = this.rateLimitMap.get(userKey);
-    
+    const requests = this.rateLimitMap.get(socketId);
+
     // Remove old requests
     while (requests.length > 0 && requests[0] < windowStart) {
       requests.shift();
@@ -103,21 +103,21 @@ class ConnectionService {
     // Check if limit exceeded
     if (requests.length >= this.maxRequestsPerWindow) {
       metrics.rateLimitHits.inc({ worker: process.pid });
-      
+
       kafkaService.logEvent('rate_limit_exceeded', {
-        userKey,
+        socketId,
         requestCount: requests.length,
         windowMs: this.rateLimitWindow
       });
-      
+
       return true;
     }
 
     // Add current request
     requests.push(now);
-    
+
     // Update connection activity
-    const connection = this.connections.get(userKey);
+    const connection = this.connections.get(socketId);
     if (connection) {
       connection.lastActivity = now;
       connection.requestCount++;
@@ -126,16 +126,16 @@ class ConnectionService {
     return false;
   }
 
-  updateActivity(userKey) {
-    const connection = this.connections.get(userKey);
+  updateActivity(socketId) {
+    const connection = this.connections.get(socketId);
     if (connection) {
       connection.lastActivity = Date.now();
       connection.requestCount++;
     }
   }
 
-  getConnection(userKey) {
-    return this.connections.get(userKey);
+  getConnection(socketId) {
+    return this.connections.get(socketId);
   }
 
   getConnectionCount() {
@@ -161,7 +161,7 @@ class ConnectionService {
       totalSessionTime += sessionDuration;
       stats.totalRequests += connection.requestCount;
 
-      if (idleTime < 300000) { // 5 minutes
+      if (idleTime < 300000) { // Active <5 min
         stats.active++;
       } else {
         stats.idle++;
@@ -176,39 +176,31 @@ class ConnectionService {
   }
 
   startCleanupTimer() {
-    this.cleanupInterval = setInterval(() => {
-      this.cleanup();
-    }, 60000); // Every minute
+    this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
   }
 
   cleanup() {
     const now = Date.now();
     const windowStart = now - this.rateLimitWindow;
-    const staleConnectionThreshold = 15 * 60 * 1000; // 15 minutes
+    const staleThreshold = 15 * 60 * 1000; // 15 minutes
 
-    // Clean up rate limit map
-    for (const [userKey, requests] of this.rateLimitMap.entries()) {
-      // Remove old requests
+    // Clean rate limit map
+    for (const [socketId, requests] of this.rateLimitMap.entries()) {
       while (requests.length > 0 && requests[0] < windowStart) {
         requests.shift();
       }
-
-      // Remove empty entries
-      if (requests.length === 0) {
-        this.rateLimitMap.delete(userKey);
-      }
+      if (requests.length === 0) this.rateLimitMap.delete(socketId);
     }
 
-    // Clean up stale connections
+    // Clean stale connections
     let staleConnections = 0;
-    for (const [userKey, connection] of this.connections.entries()) {
+    for (const [socketId, connection] of this.connections.entries()) {
       const idleTime = now - connection.lastActivity;
-      
-      if (idleTime > staleConnectionThreshold) {
-        this.connections.delete(userKey);
+      if (idleTime > staleThreshold) {
+        this.connections.delete(socketId);
         staleConnections++;
-        
-        kafkaService.logConnectionEvent('connection_cleanup', userKey, connection.socketId, {
+
+        kafkaService.logConnectionEvent('connection_cleanup', socketId, connection.socketId, {
           reason: 'stale',
           idleTime,
           sessionDuration: now - connection.connectedAt
@@ -223,7 +215,6 @@ class ConnectionService {
       });
     }
 
-    // Log cleanup stats
     logger.debug('Connection cleanup completed', {
       activeConnections: this.connections.size,
       rateLimitEntries: this.rateLimitMap.size,
@@ -232,24 +223,19 @@ class ConnectionService {
     });
   }
 
-  // Health monitoring
   async healthCheck() {
     const stats = this.getConnectionStats();
-    const queueStats = await this.getRateLimitQueueStats();
+    const queueStats = this.getRateLimitQueueStats();
 
     return {
       connections: {
         total: stats.total,
         active: stats.active,
         idle: stats.idle,
-        avgSessionDuration: Math.round(stats.avgSessionDuration / 1000), // in seconds
+        avgSessionDuration: Math.round(stats.avgSessionDuration / 1000),
         totalRequests: stats.totalRequests
       },
-      rateLimit: {
-        activeEntries: queueStats.activeEntries,
-        totalRequests: queueStats.totalRequests,
-        avgRequestsPerEntry: queueStats.avgRequestsPerEntry
-      }
+      rateLimit: queueStats
     };
   }
 
@@ -271,10 +257,9 @@ class ConnectionService {
     };
   }
 
-  // Get user connection info
-  async getUserInfo(userKey) {
-    const localConnection = this.connections.get(userKey);
-    const redisSocketId = await redisService.getSocketId(userKey);
+  async getUserInfo(socketId) {
+    const localConnection = this.connections.get(socketId);
+    const redisSocketId = await redisService.getSocketId(socketId);
 
     return {
       local: localConnection || null,
@@ -283,25 +268,24 @@ class ConnectionService {
     };
   }
 
-  // Force disconnect a user (admin function)
-  async forceDisconnect(userKey, reason = 'admin') {
+  async forceDisconnect(socketId, reason = 'admin') {
     try {
-      const connection = this.connections.get(userKey);
+      const connection = this.connections.get(socketId);
       if (connection) {
-        kafkaService.logConnectionEvent('force_disconnect', userKey, connection.socketId, {
+        kafkaService.logConnectionEvent('force_disconnect', socketId, connection.socketId, {
           reason,
           sessionDuration: Date.now() - connection.connectedAt
         });
       }
 
-      await this.handleDisconnect(userKey);
-      
-      logger.info('User force disconnected', { userKey, reason, worker: process.pid });
+      await this.handleDisconnect(socketId);
+
+      logger.info('User force disconnected', { socketId, reason, worker: process.pid });
       return true;
     } catch (error) {
       logger.error('Failed to force disconnect user', {
         error: error.message,
-        userKey,
+        socketId,
         reason,
         worker: process.pid
       });
@@ -309,20 +293,18 @@ class ConnectionService {
     }
   }
 
-  // Bulk operations for monitoring
   async getAllConnections() {
-    const connections = [];
     const now = Date.now();
+    const connections = [];
 
-    for (const [userKey, connection] of this.connections.entries()) {
+    for (const [socketId, conn] of this.connections.entries()) {
       connections.push({
-        userKey,
-        socketId: connection.socketId,
-        connectedAt: connection.connectedAt,
-        lastActivity: connection.lastActivity,
-        sessionDuration: now - connection.connectedAt,
-        idleTime: now - connection.lastActivity,
-        requestCount: connection.requestCount
+        socketId,
+        connectedAt: conn.connectedAt,
+        lastActivity: conn.lastActivity,
+        sessionDuration: now - conn.connectedAt,
+        idleTime: now - conn.lastActivity,
+        requestCount: conn.requestCount
       });
     }
 
@@ -332,68 +314,41 @@ class ConnectionService {
   async getActiveUsers(limit = 50) {
     const connections = await this.getAllConnections();
     return connections
-      .filter(conn => conn.idleTime < 300000) // Active in last 5 minutes
+      .filter(conn => conn.idleTime < 300000)
       .slice(0, limit);
   }
 
-  // Sync with Redis (useful for debugging)
   async syncWithRedis() {
-    const syncResults = {
-      localOnly: [],
-      redisOnly: [],
-      synced: 0,
-      errors: []
-    };
+    const results = { localOnly: [], redisOnly: [], synced: 0, errors: [] };
 
-    try {
-      // Check local connections against Redis
-      for (const [userKey, connection] of this.connections.entries()) {
-        try {
-          const redisSocketId = await redisService.getSocketId(userKey);
-          
-          if (redisSocketId === connection.socketId) {
-            syncResults.synced++;
-          } else if (!redisSocketId) {
-            syncResults.localOnly.push(userKey);
-          }
-        } catch (error) {
-          syncResults.errors.push({ userKey, error: error.message });
+    for (const [socketId, conn] of this.connections.entries()) {
+      try {
+        const redisSocketId = await redisService.getSocketId(socketId);
+        if (redisSocketId === conn.socketId) {
+          results.synced++;
+        } else if (!redisSocketId) {
+          results.localOnly.push(socketId);
         }
+      } catch (error) {
+        results.errors.push({ socketId, error: error.message });
       }
-
-      logger.info('Redis sync completed', {
-        ...syncResults,
-        worker: process.pid
-      });
-
-    } catch (error) {
-      logger.error('Failed to sync with Redis', {
-        error: error.message,
-        worker: process.pid
-      });
     }
 
-    return syncResults;
+    logger.info('Redis sync completed', { ...results, worker: process.pid });
+    return results;
   }
 
   async shutdown() {
     logger.info('Shutting down connection service', { worker: process.pid });
 
-    // Clear cleanup timer
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
     }
 
-    // Log final statistics
     const finalStats = this.getConnectionStats();
-    kafkaService.logEvent('service_shutdown', {
-      service: 'connection',
-      finalStats,
-      worker: process.pid
-    });
+    kafkaService.logEvent('service_shutdown', { service: 'connection', finalStats, worker: process.pid });
 
-    // Clear local storage
     this.connections.clear();
     this.rateLimitMap.clear();
 

@@ -185,29 +185,5 @@ networks:
       config:
         - subnet: 172.20.0.0/16
 
-# Development override
----
-# docker-compose.override.yml (for development)
-version: '3.8'
-
-services:
-  webrtc-chat:
-    build:
-      target: development
-    environment:
-      NODE_ENV: development
-      LOG_LEVEL: debug
-      CLUSTER_WORKERS: 1
-    volumes:
-      - .:/app
-      - /app/node_modules
-    command: npm run dev
-
-  # Development tools
-  mailhog:
-    image: mailhog/mailhog:latest
-    ports:
-      - "1025:1025"
-      - "8025:8025"
-    networks:
-      - webrtc-network
+# Development override should be placed in a separate file named docker-compose.override.yml
+# Remove this section from docker-compose.yml to avoid duplicate keys error.

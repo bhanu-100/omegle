@@ -155,7 +155,7 @@ class KafkaService {
     this.eventBatch.push({
       topic: process.env.KAFKA_TOPIC_EVENTS || 'webrtc-events',
       messages: [{
-        key: eventData.userKey || null,
+        key: eventData.socketId || null,
         value: JSON.stringify(event),
         timestamp: event.timestamp
       }]
@@ -198,36 +198,35 @@ class KafkaService {
   }
 
   // Specialized event logging methods
-  logConnectionEvent(eventType, userKey, socketId, additionalData = {}) {
+  logConnectionEvent(eventType, socketId, additionalData = {}) {
     this.logEvent(eventType, {
-      userKey,
       socketId,
       ...additionalData
     });
   }
 
-  logMatchmakingEvent(eventType, userKey, peerKey = null, roomId = null, additionalData = {}) {
+  logMatchmakingEvent(eventType, socketId, peerId = null, roomId = null, additionalData = {}) {
     this.logEvent(eventType, {
-      userKey,
-      peerKey,
+      socketId,
+      peerId,
       roomId,
       ...additionalData
     });
   }
 
-  logSignalingEvent(eventType, userKey, peerKey, signalType, additionalData = {}) {
+  logSignalingEvent(eventType, socketId, peerId, signalType, additionalData = {}) {
     this.logEvent(eventType, {
-      userKey,
-      peerKey,
+      socketId,
+      peerId,
       signalType,
       ...additionalData
     });
   }
 
-  logErrorEvent(errorType, userKey = null, error, additionalData = {}) {
+  logErrorEvent(errorType, socketId = null, error, additionalData = {}) {
     this.logEvent('error', {
       errorType,
-      userKey,
+      socketId,
       error: {
         message: error.message || error,
         stack: error.stack,
@@ -237,11 +236,11 @@ class KafkaService {
     });
   }
 
-  logPerformanceEvent(metricType, value, userKey = null, additionalData = {}) {
+  logPerformanceEvent(metricType, value, socketId = null, additionalData = {}) {
     this.logEvent('performance', {
       metricType,
       value,
-      userKey,
+      socketId,
       ...additionalData
     });
   }

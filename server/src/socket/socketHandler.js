@@ -168,10 +168,11 @@ class SocketHandler {
   setupGlobalHandlers() {
     // Handle peer disconnection notifications across servers
     this.io.on('peer_disconnected_global', (data) => {
-      const { targetUser, disconnectedUser, reason, timestamp, roomId } = data;
+      const { targetSocketId, disconnectedSocketId, reason, timestamp, roomId } = data;
       
-      this.io.to(targetUser).emit('peer_disconnected', {
-        peerKey: disconnectedUser,
+      // Emit to the target socket ID directly
+      this.io.to(targetSocketId).emit('peer_disconnected', {
+        peerId: disconnectedSocketId,
         reason,
         timestamp,
         roomId
@@ -202,13 +203,14 @@ class SocketHandler {
     const userAgent = socket.handshake.headers['user-agent'];
     
     try {
-      // Enhanced user key generation with collision prevention
-      const userKey = await this.generateUniqueUserKey();
+      // Use socket.id as the primary identifier
+      const socketId = socket.id;
       
       // Rate limiting check with IP-based tracking
       if (await this.isConnectionRateLimited(clientIP)) {
         logger.warn('Connection rate limit exceeded', { 
           clientIP, 
+          socketId,
           userAgent: userAgent?.substring(0, 100),
           worker: process.pid 
         });
@@ -224,8 +226,8 @@ class SocketHandler {
       }
 
       // Store connection info
-      this.activeConnections.set(socket.id, {
-        userKey,
+      this.activeConnections.set(socketId, {
+        socketId,
         clientIP,
         userAgent,
         connectedAt: Date.now(),
@@ -237,8 +239,7 @@ class SocketHandler {
       metrics.signalingMessages.inc({ type: 'connect', worker: process.pid });
 
       logger.info('User connected', {
-        userKey,
-        socketId: socket.id,
+        socketId,
         clientIP,
         userAgent: userAgent?.substring(0, 100),
         connectionTime: Date.now() - startTime,
@@ -246,7 +247,7 @@ class SocketHandler {
       });
 
       // Register connection in services
-      await this.registerConnection(userKey, socket.id, {
+      await this.registerConnection(socketId, {
         clientIP,
         userAgent,
         connectedAt: Date.now()
@@ -254,8 +255,7 @@ class SocketHandler {
       
       // Log connection event
       kafkaService.logEvent('connect', {
-        userKey,
-        socketId: socket.id,
+        socketId,
         clientIP,
         userAgent,
         connectionTime: Date.now() - startTime,
@@ -263,11 +263,11 @@ class SocketHandler {
       });
 
       // Setup event handlers with enhanced error handling
-      this.setupEventHandlers(socket, userKey);
+      this.setupEventHandlers(socket);
       
       // Send connection confirmation
       socket.emit('connected', {
-        userKey,
+        socketId,
         timestamp: Date.now(),
         serverInfo: {
           worker: process.pid,
@@ -279,6 +279,7 @@ class SocketHandler {
       logger.error('Error handling connection', {
         error: error.message,
         stack: error.stack,
+        socketId: socket.id,
         clientIP,
         worker: process.pid
       });
@@ -290,26 +291,6 @@ class SocketHandler {
       });
       socket.disconnect(true);
     }
-  }
-
-  async generateUniqueUserKey() {
-    let attempts = 0;
-    const maxAttempts = 5;
-    
-    while (attempts < maxAttempts) {
-      const userKey = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      
-      // Check if key already exists
-      const exists = await redisService.exists(`user_session:${userKey}`);
-      if (!exists) {
-        return userKey;
-      }
-      
-      attempts++;
-      await new Promise(resolve => setTimeout(resolve, 10)); // Small delay
-    }
-    
-    throw new Error('Failed to generate unique user key after maximum attempts');
   }
 
   getClientIP(socket) {
@@ -331,11 +312,11 @@ class SocketHandler {
     return current > this.rateLimits.connection.maxAttempts;
   }
 
-  async registerConnection(userKey, socketId, metadata) {
+  async registerConnection(socketId, metadata) {
     try {
       await Promise.all([
-        connectionService.registerConnection(userKey, socketId, metadata),
-        redisService.setHash(`user_session:${userKey}`, {
+        connectionService.registerConnection(socketId, metadata),
+        redisService.setHash(`user_session:${socketId}`, {
           socketId,
           ...metadata,
           worker: process.pid
@@ -344,7 +325,6 @@ class SocketHandler {
     } catch (error) {
       logger.error('Failed to register connection', {
         error: error.message,
-        userKey,
         socketId,
         worker: process.pid
       });
@@ -352,13 +332,14 @@ class SocketHandler {
     }
   }
 
-  setupEventHandlers(socket, userKey) {
-    const connectionInfo = this.activeConnections.get(socket.id);
+  setupEventHandlers(socket) {
+    const socketId = socket.id;
+    const connectionInfo = this.activeConnections.get(socketId);
     
     // Enhanced matchmaking with preferences
     socket.on('find_match', async (data = {}) => {
       try {
-        if (await this.isRateLimited(userKey, 'matchmaking')) {
+        if (await this.isRateLimited(socketId, 'matchmaking')) {
           socket.emit('rate_limited', { 
             type: 'matchmaking',
             message: 'Too many match requests. Please wait.',
@@ -367,7 +348,7 @@ class SocketHandler {
           return;
         }
 
-        this.updateActivity(socket.id);
+        this.updateActivity(socketId);
         
         // Extract user preferences
         const preferences = {
@@ -378,12 +359,12 @@ class SocketHandler {
           minConnectionQuality: data.minConnectionQuality || 0
         };
 
-        await matchmakingService.findMatch(socket, userKey, this.io, preferences);
+        await matchmakingService.findMatch(socket, this.io, preferences);
         
       } catch (error) {
         logger.error('Find match error', {
           error: error.message,
-          userKey,
+          socketId,
           worker: process.pid
         });
         
@@ -396,13 +377,13 @@ class SocketHandler {
 
     socket.on('cancel_match', async () => {
       try {
-        this.updateActivity(socket.id);
-        await matchmakingService.cancelMatch(userKey);
+        this.updateActivity(socketId);
+        await matchmakingService.cancelMatch(socketId);
         socket.emit('match_cancelled', { timestamp: Date.now() });
       } catch (error) {
         logger.error('Cancel match error', {
           error: error.message,
-          userKey,
+          socketId,
           worker: process.pid
         });
       }
@@ -411,7 +392,7 @@ class SocketHandler {
     // Enhanced WebRTC signaling with validation
     socket.on('webrtc_offer', async (data) => {
       try {
-        if (await this.isRateLimited(userKey, 'signaling')) {
+        if (await this.isRateLimited(socketId, 'signaling')) {
           socket.emit('rate_limited', { 
             type: 'signaling',
             message: 'Too many signaling messages'
@@ -419,7 +400,7 @@ class SocketHandler {
           return;
         }
 
-        this.updateActivity(socket.id);
+        this.updateActivity(socketId);
         
         if (!this.validateWebRTCData(data)) {
           socket.emit('error', {
@@ -429,16 +410,16 @@ class SocketHandler {
           return;
         }
 
-        await signalingService.forwardSignal(socket, userKey, 'webrtc_offer', data);
+        await signalingService.forwardSignal(socket, socketId, 'webrtc_offer', data);
         
       } catch (error) {
-        this.handleSignalingError(error, socket, userKey, 'webrtc_offer');
+        this.handleSignalingError(error, socket, socketId, 'webrtc_offer');
       }
     });
 
     socket.on('webrtc_answer', async (data) => {
       try {
-        if (await this.isRateLimited(userKey, 'signaling')) {
+        if (await this.isRateLimited(socketId, 'signaling')) {
           socket.emit('rate_limited', { 
             type: 'signaling',
             message: 'Too many signaling messages'
@@ -446,7 +427,7 @@ class SocketHandler {
           return;
         }
 
-        this.updateActivity(socket.id);
+        this.updateActivity(socketId);
         
         if (!this.validateWebRTCData(data)) {
           socket.emit('error', {
@@ -456,30 +437,30 @@ class SocketHandler {
           return;
         }
 
-        await signalingService.forwardSignal(socket, userKey, 'webrtc_answer', data);
+        await signalingService.forwardSignal(socket, socketId, 'webrtc_answer', data);
         
       } catch (error) {
-        this.handleSignalingError(error, socket, userKey, 'webrtc_answer');
+        this.handleSignalingError(error, socket, socketId, 'webrtc_answer');
       }
     });
 
     socket.on('webrtc_ice_candidate', async (data) => {
       try {
-        if (await this.isRateLimited(userKey, 'signaling')) return;
+        if (await this.isRateLimited(socketId, 'signaling')) return;
 
-        this.updateActivity(socket.id);
+        this.updateActivity(socketId);
         
         if (!this.validateICECandidate(data)) {
           return; // Silently ignore invalid ICE candidates
         }
 
-        await signalingService.forwardSignal(socket, userKey, 'webrtc_ice_candidate', data);
+        await signalingService.forwardSignal(socket, socketId, 'webrtc_ice_candidate', data);
         
       } catch (error) {
         // Don't emit errors for ICE candidates as they're frequent and failures are normal
         logger.debug('ICE candidate forwarding failed', {
           error: error.message,
-          userKey,
+          socketId,
           worker: process.pid
         });
       }
@@ -488,7 +469,7 @@ class SocketHandler {
     // Enhanced messaging with content filtering
     socket.on('message', async (data) => {
       try {
-        if (await this.isRateLimited(userKey, 'messaging')) {
+        if (await this.isRateLimited(socketId, 'messaging')) {
           socket.emit('rate_limited', { 
             type: 'messaging',
             message: 'Too many messages. Please slow down.'
@@ -496,7 +477,7 @@ class SocketHandler {
           return;
         }
 
-        this.updateActivity(socket.id);
+        this.updateActivity(socketId);
         
         if (!this.validateMessage(data)) {
           socket.emit('error', {
@@ -509,12 +490,12 @@ class SocketHandler {
         // Content filtering (implement your content filter here)
         const sanitizedMessage = this.sanitizeMessage(data);
         
-        await signalingService.forwardMessage(socket, userKey, sanitizedMessage);
+        await signalingService.forwardMessage(socket, socketId, sanitizedMessage);
         
       } catch (error) {
         logger.error('Message forwarding error', {
           error: error.message,
-          userKey,
+          socketId,
           worker: process.pid
         });
         
@@ -528,10 +509,10 @@ class SocketHandler {
     // Connection quality monitoring
     socket.on('connection_quality', async (data) => {
       try {
-        this.updateActivity(socket.id);
+        this.updateActivity(socketId);
         
         if (this.validateQualityData(data)) {
-          await redisService.setHash(`connection_quality:${userKey}`, {
+          await redisService.setHash(`connection_quality:${socketId}`, {
             overall: data.overall || 50,
             rtt: data.rtt || 0,
             packetsLost: data.packetsLost || 0,
@@ -542,7 +523,7 @@ class SocketHandler {
           metrics.connectionQuality.observe(data.rtt || 0);
           
           kafkaService.logEvent('connection_quality', {
-            userKey,
+            socketId,
             ...data,
             worker: process.pid
           });
@@ -550,7 +531,7 @@ class SocketHandler {
       } catch (error) {
         logger.debug('Connection quality update failed', {
           error: error.message,
-          userKey,
+          socketId,
           worker: process.pid
         });
       }
@@ -559,12 +540,12 @@ class SocketHandler {
     // Skip/next functionality
     socket.on('skip', async () => {
       try {
-        this.updateActivity(socket.id);
-        await signalingService.handleSkip(socket, userKey);
+        this.updateActivity(socketId);
+        await signalingService.handleSkip(socket, socketId);
       } catch (error) {
         logger.error('Skip handling error', {
           error: error.message,
-          userKey,
+          socketId,
           worker: process.pid
         });
       }
@@ -573,18 +554,18 @@ class SocketHandler {
     // Error handling
     socket.on('webrtc_error', (error) => {
       logger.error('WebRTC error from client', {
-        userKey,
+        socketId,
         error: error.message || error,
         worker: process.pid
       });
       
       metrics.errorRate.inc({ type: 'webrtc_client', worker: process.pid });
-      kafkaService.logEvent('webrtc_error', { userKey, error, worker: process.pid });
+      kafkaService.logEvent('webrtc_error', { socketId, error, worker: process.pid });
     });
 
     socket.on('error', (error) => {
       logger.error('Socket error', {
-        userKey,
+        socketId,
         error: error.message || error,
         worker: process.pid
       });
@@ -594,7 +575,7 @@ class SocketHandler {
 
     // Enhanced heartbeat with connection health
     socket.on('ping', () => {
-      this.updateActivity(socket.id);
+      this.updateActivity(socketId);
       socket.emit('pong', { 
         timestamp: Date.now(),
         serverTime: Date.now(),
@@ -604,14 +585,14 @@ class SocketHandler {
 
     // Disconnect handling with enhanced cleanup
     socket.on('disconnect', async (reason) => {
-      await this.handleDisconnect(socket, userKey, reason);
+      await this.handleDisconnect(socket, socketId, reason);
     });
 
     // Connection validation
     socket.on('validate_connection', () => {
-      this.updateActivity(socket.id);
+      this.updateActivity(socketId);
       socket.emit('connection_valid', {
-        userKey,
+        socketId,
         timestamp: Date.now(),
         worker: process.pid
       });
@@ -665,11 +646,11 @@ class SocketHandler {
     }
   }
 
-  async isRateLimited(userKey, type) {
+  async isRateLimited(socketId, type) {
     const limit = this.rateLimits[type];
     if (!limit) return false;
 
-    const key = `rate_limit:${type}:${userKey}`;
+    const key = `rate_limit:${type}:${socketId}`;
     const current = await redisService.incr(key);
     
     if (current === 1) {
@@ -684,10 +665,10 @@ class SocketHandler {
     return false;
   }
 
-  handleSignalingError(error, socket, userKey, signalType) {
+  handleSignalingError(error, socket, socketId, signalType) {
     logger.error('Signaling error', {
       error: error.message,
-      userKey,
+      socketId,
       signalType,
       worker: process.pid
     });
@@ -700,15 +681,14 @@ class SocketHandler {
     });
   }
 
-  async handleDisconnect(socket, userKey, reason) {
+  async handleDisconnect(socket, socketId, reason) {
     const disconnectStart = Date.now();
     
     try {
-      const connectionInfo = this.activeConnections.get(socket.id);
+      const connectionInfo = this.activeConnections.get(socketId);
       
       logger.info('User disconnected', {
-        userKey,
-        socketId: socket.id,
+        socketId,
         reason,
         sessionDuration: connectionInfo ? Date.now() - connectionInfo.connectedAt : 0,
         worker: process.pid
@@ -716,9 +696,9 @@ class SocketHandler {
 
       // Parallel cleanup operations
       await Promise.allSettled([
-        matchmakingService.handleDisconnect(userKey, this.io),
-        connectionService.handleDisconnect(userKey),
-        this.cleanupUserData(userKey)
+        matchmakingService.handleDisconnect(socketId, this.io),
+        connectionService.handleDisconnect(socketId),
+        this.cleanupUserData(socketId)
       ]);
 
       // Update metrics
@@ -727,11 +707,11 @@ class SocketHandler {
       metrics.disconnectDuration.observe((Date.now() - disconnectStart) / 1000);
 
       // Remove from active connections
-      this.activeConnections.delete(socket.id);
+      this.activeConnections.delete(socketId);
 
       // Log disconnect event
       kafkaService.logEvent('disconnect', {
-        userKey,
+        socketId,
         reason,
         sessionDuration: connectionInfo ? Date.now() - connectionInfo.connectedAt : 0,
         disconnectDuration: Date.now() - disconnectStart,
@@ -742,7 +722,7 @@ class SocketHandler {
       logger.error('Error handling disconnect', {
         error: error.message,
         stack: error.stack,
-        userKey,
+        socketId,
         worker: process.pid
       });
       
@@ -750,20 +730,20 @@ class SocketHandler {
     }
   }
 
-  async cleanupUserData(userKey) {
+  async cleanupUserData(socketId) {
     try {
       const keys = [
-        `user_session:${userKey}`,
-        `user_preferences:${userKey}`,
-        `connection_quality:${userKey}`,
-        `queue_position:${userKey}`
+        `user_session:${socketId}`,
+        `user_preferences:${socketId}`,
+        `connection_quality:${socketId}`,
+        `queue_position:${socketId}`
       ];
 
       await Promise.all(keys.map(key => redisService.deleteKey(key)));
     } catch (error) {
       logger.error('Failed to cleanup user data', {
         error: error.message,
-        userKey,
+        socketId,
         worker: process.pid
       });
     }
@@ -789,7 +769,6 @@ class SocketHandler {
       if (now - connection.lastActivity > inactivityTimeout) {
         logger.info('Disconnecting inactive connection', {
           socketId,
-          userKey: connection.userKey,
           inactiveFor: now - connection.lastActivity,
           worker: process.pid
         });
@@ -849,7 +828,7 @@ class SocketHandler {
       for (const [socketId, connection] of this.activeConnections.entries()) {
         const socket = this.io.sockets.sockets.get(socketId);
         if (socket) {
-          await this.handleDisconnect(socket, connection.userKey, 'server_shutdown');
+          await this.handleDisconnect(socket, socketId, 'server_shutdown');
           socket.disconnect(true);
         }
       }

@@ -324,14 +324,7 @@ class RedisService {
   }
 
   async getHash(key) {
-    try {
-      const result = await this.client.hgetall(key);
-      metrics.redisOperations.inc({ operation: 'hgetall', worker: process.pid });
-      return result || {};
-    } catch (error) {
-      this.handleError('hgetall', error);
-      throw error;
-    }
+    return key;
   }
 
   async updateHashField(key, field, value) {
@@ -491,7 +484,7 @@ class RedisService {
 
   async setMatch(user1, user2, roomId) {
     const matchData = {
-      peerKey: user2,
+      peerId: user2,
       roomId,
       createdAt: Date.now(),
       status: 'active'
@@ -499,8 +492,8 @@ class RedisService {
     
     try {
       await Promise.all([
-        this.client.set(`user_match:${user1}`, JSON.stringify({ ...matchData, peerKey: user2 })),
-        this.client.set(`user_match:${user2}`, JSON.stringify({ ...matchData, peerKey: user1 })),
+        this.client.set(`user_match:${user1}`, JSON.stringify({ ...matchData, peerId: user2 })),
+        this.client.set(`user_match:${user2}`, JSON.stringify({ ...matchData, peerId: user1 })),
         this.client.sadd('active_matches', `${user1}:${user2}`)
       ]);
       return true;
@@ -510,9 +503,9 @@ class RedisService {
     }
   }
 
-  async getMatch(userKey) {
+  async getMatch(socketId) {
     try {
-      const matchData = await this.client.get(`user_match:${userKey}`);
+      const matchData = await this.client.get(`user_match:${socketId}`);
       if (matchData) {
         return JSON.parse(matchData);
       }
@@ -523,9 +516,9 @@ class RedisService {
     }
   }
 
-  async deleteMatch(userKey) {
+  async deleteMatch(socketId) {
     try {
-      await this.client.del(`user_match:${userKey}`);
+      await this.client.del(`user_match:${socketId}`);
       metrics.redisOperations.inc({ operation: 'delete_match', worker: process.pid });
       return true;
     } catch (error) {
@@ -549,9 +542,9 @@ class RedisService {
       const results = await pipeline.exec();
       
       for (let i = 0; i < keys.length; i++) {
-        const userKey = keys[i].replace('user_match:', '');
+        const socketId = keys[i].replace('user_match:', '');
         if (results[i][1]) {
-          matches[userKey] = JSON.parse(results[i][1]);
+          matches[socketId] = JSON.parse(results[i][1]);
         }
       }
       
@@ -563,19 +556,13 @@ class RedisService {
   }
 
   // Connection and session management
-  async getSocketId(userKey) {
-    try {
-      const sessionData = await this.getHash(`user_session:${userKey}`);
-      return sessionData.socketId || null;
-    } catch (error) {
-      this.handleError('get_socket_id', error);
-      return null;
-    }
+  async getSocketId(socketId) {
+    return socketId;
   }
 
-  async updateUserStats(userKey, stats) {
+  async updateUserStats(socketId, stats) {
     try {
-      const key = `user_stats:${userKey}`;
+      const key = `user_stats:${socketId}`;
       const current = await this.getHash(key);
       
       const updated = {

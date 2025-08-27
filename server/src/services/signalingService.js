@@ -15,15 +15,15 @@ class SignalingService {
     };
   }
 
-  async forwardSignal(socket, fromUserKey, signalType, data) {
+  async forwardSignal(socket, fromSocketId, signalType, data) {
     const startTime = Date.now();
     
     try {
       // Get the peer user from active match
-      const matchData = await redisService.getMatch(fromUserKey);
-      if (!matchData || !matchData.peerKey) {
+      const matchData = await redisService.getMatch(fromSocketId);
+      if (!matchData || !matchData.peerId) {
         logger.debug('No active match found for signal forwarding', {
-          userKey: fromUserKey,
+          socketId: fromSocketId,
           signalType,
           worker: process.pid
         });
@@ -36,7 +36,7 @@ class SignalingService {
         return false;
       }
 
-      const toUserKey = matchData.peerKey;
+      const toUserKey = matchData.peerId;
       
       // Validate signal data
       if (!this.validateSignalData(signalType, data)) {
@@ -261,7 +261,7 @@ class SignalingService {
     try {
       // Get the peer user from active match
       const matchData = await redisService.getMatch(fromUserKey);
-      if (!matchData || !matchData.peerKey) {
+      if (!matchData || !matchData.peerId) {
         socket.emit('message_error', {
           error: 'no_active_match',
           message: 'No active match found'
@@ -269,7 +269,7 @@ class SignalingService {
         return false;
       }
 
-      const toUserKey = matchData.peerKey;
+      const toUserKey = matchData.peerId;
       
       // Validate message
       if (!this.validateMessage(messageData)) {
@@ -374,21 +374,21 @@ class SignalingService {
     }
   }
 
-  async handleSkip(socket, userKey) {
+  async handleSkip(socket, socketId) {
     try {
       // Get current match
-      const matchData = await redisService.getMatch(userKey);
-      if (!matchData || !matchData.peerKey) {
+      const matchData = await redisService.getMatch(socketId);
+      if (!matchData || !matchData.peerId) {
         return;
       }
 
-      const peerKey = matchData.peerKey;
+      const peerId = matchData.peerId;
       
       // Notify peer about skip
       const skipMessage = {
         type: 'peer_skipped',
-        from: userKey,
-        to: peerKey,
+        from: socketId,
+        to: peerId,
         data: {
           reason: 'user_skip',
           timestamp: Date.now()
@@ -400,18 +400,18 @@ class SignalingService {
       
       // Clean up match data
       await Promise.all([
-        redisService.deleteMatch(userKey),
-        redisService.deleteMatch(peerKey)
+        redisService.deleteMatch(socketId),
+        redisService.deleteMatch(peerId)
       ]);
 
       // Log skip event
-      kafkaService.logMatchmakingEvent('user_skipped', userKey, peerKey, matchData.roomId, {
+      kafkaService.logMatchmakingEvent('user_skipped', socketId, peerId, matchData.roomId, {
         reason: 'manual_skip'
       });
 
       logger.info('Skip handled successfully', {
-        userKey,
-        peerKey,
+        socketId,
+        peerId,
         roomId: matchData.roomId,
         worker: process.pid
       });
@@ -419,7 +419,7 @@ class SignalingService {
     } catch (error) {
       logger.error('Error handling skip', {
         error: error.message,
-        userKey,
+        socketId,
         worker: process.pid
       });
     }
@@ -427,19 +427,19 @@ class SignalingService {
 
   async queueSignalForOfflineDelivery(signalMessage) {
     try {
-      const { to: userKey } = signalMessage;
+      const { to: socketId } = signalMessage;
       
-      if (!this.messageQueue.has(userKey)) {
-        this.messageQueue.set(userKey, []);
+      if (!this.messageQueue.has(socketId)) {
+        this.messageQueue.set(socketId, []);
       }
       
-      const userQueue = this.messageQueue.get(userKey);
+      const userQueue = this.messageQueue.get(socketId);
       
       // Implement queue size limit
       if (userQueue.length >= this.maxQueueSize) {
         userQueue.shift(); // Remove oldest message
         logger.debug('Message queue full, removing oldest message', {
-          userKey,
+          socketId,
           queueSize: userQueue.length,
           worker: process.pid
         });
@@ -451,13 +451,13 @@ class SignalingService {
       
       // Store in Redis for persistence across server restarts
       await redisService.set(
-        `offline_signals:${userKey}`,
+        `offline_signals:${socketId}`,
         JSON.stringify(userQueue),
         300 // 5 minutes TTL
       );
       
       logger.debug('Signal queued for offline delivery', {
-        userKey,
+        socketId,
         signalType: signalMessage.type,
         queueSize: userQueue.length,
         worker: process.pid
@@ -474,8 +474,8 @@ class SignalingService {
 
   async queueMessageForOfflineDelivery(message) {
     try {
-      const { to: userKey } = message;
-      const key = `offline_messages:${userKey}`;
+      const { to: socketId } = message;
+      const key = `offline_messages:${socketId}`;
       
       // Get existing queue
       const existingQueue = await redisService.get(key);
@@ -493,7 +493,7 @@ class SignalingService {
       await redisService.set(key, JSON.stringify(messageQueue), 300);
       
       logger.debug('Message queued for offline delivery', {
-        userKey,
+        socketId,
         messageId: message.messageId,
         queueSize: messageQueue.length,
         worker: process.pid
@@ -508,10 +508,10 @@ class SignalingService {
     }
   }
 
-  async deliverQueuedMessages(userKey) {
+  async deliverQueuedMessages(socketId) {
     try {
       // Deliver queued signals
-      const queuedSignals = await redisService.get(`offline_signals:${userKey}`);
+      const queuedSignals = await redisService.get(`offline_signals:${socketId}`);
       if (queuedSignals) {
         const signals = JSON.parse(queuedSignals);
         const currentTime = Date.now();
@@ -522,18 +522,18 @@ class SignalingService {
           }
         }
         
-        await redisService.deleteKey(`offline_signals:${userKey}`);
-        this.messageQueue.delete(userKey);
+        await redisService.deleteKey(`offline_signals:${socketId}`);
+        this.messageQueue.delete(socketId);
         
         logger.debug('Delivered queued signals', {
-          userKey,
+          socketId,
           count: signals.length,
           worker: process.pid
         });
       }
       
       // Deliver queued messages
-      const queuedMessages = await redisService.get(`offline_messages:${userKey}`);
+      const queuedMessages = await redisService.get(`offline_messages:${socketId}`);
       if (queuedMessages) {
         const messages = JSON.parse(queuedMessages);
         const currentTime = Date.now();
@@ -544,10 +544,10 @@ class SignalingService {
           }
         }
         
-        await redisService.deleteKey(`offline_messages:${userKey}`);
+        await redisService.deleteKey(`offline_messages:${socketId}`);
         
         logger.debug('Delivered queued messages', {
-          userKey,
+          socketId,
           count: messages.length,
           worker: process.pid
         });
@@ -556,7 +556,7 @@ class SignalingService {
     } catch (error) {
       logger.error('Failed to deliver queued messages', {
         error: error.message,
-        userKey,
+        socketId,
         worker: process.pid
       });
     }
@@ -625,14 +625,14 @@ class SignalingService {
       const currentTime = Date.now();
       
       // Clean up in-memory queues
-      for (const [userKey, queue] of this.messageQueue.entries()) {
+      for (const [socketId, queue] of this.messageQueue.entries()) {
         const validMessages = queue.filter(msg => msg.expiresAt > currentTime);
         
         if (validMessages.length !== queue.length) {
-          this.messageQueue.set(userKey, validMessages);
+          this.messageQueue.set(socketId, validMessages);
           
           logger.debug('Cleaned up expired messages from memory queue', {
-            userKey,
+            socketId,
             removed: queue.length - validMessages.length,
             remaining: validMessages.length,
             worker: process.pid
@@ -641,7 +641,7 @@ class SignalingService {
         
         // Remove empty queues
         if (validMessages.length === 0) {
-          this.messageQueue.delete(userKey);
+          this.messageQueue.delete(socketId);
         }
       }
       
@@ -714,7 +714,7 @@ class SignalingService {
 
   async handleCrossServerSignal(signalData) {
     try {
-      const { to: userKey, type: signalType, data, sourceWorker } = signalData;
+      const { to: socketId, type: signalType, data, sourceWorker } = signalData;
       
       // Don't handle signals from same worker
       if (sourceWorker === process.pid) {
@@ -722,7 +722,7 @@ class SignalingService {
       }
       
       // Check if target user is on this server
-      const sessionData = await redisService.getHash(`user_session:${userKey}`);
+      const sessionData = await redisService.getHash(`user_session:${socketId}`);
       if (!sessionData || parseInt(sessionData.worker) !== process.pid) {
         return;
       }
@@ -735,7 +735,7 @@ class SignalingService {
         socket.emit(signalType, data);
         
         logger.debug('Cross-server signal delivered', {
-          userKey,
+          socketId,
           signalType,
           sourceWorker,
           targetWorker: process.pid
@@ -759,7 +759,7 @@ class SignalingService {
 
   async handleCrossServerMessage(messageData) {
     try {
-      const { to: userKey, data, sourceWorker } = messageData;
+      const { to: socketId, data, sourceWorker } = messageData;
       
       // Don't handle messages from same worker
       if (sourceWorker === process.pid) {
@@ -767,7 +767,7 @@ class SignalingService {
       }
       
       // Check if target user is on this server
-      const sessionData = await redisService.getHash(`user_session:${userKey}`);
+      const sessionData = await redisService.getHash(`user_session:${socketId}`);
       if (!sessionData || parseInt(sessionData.worker) !== process.pid) {
         return;
       }
@@ -780,7 +780,7 @@ class SignalingService {
         socket.emit('message', data);
         
         logger.debug('Cross-server message delivered', {
-          userKey,
+          socketId,
           sourceWorker,
           targetWorker: process.pid
         });
