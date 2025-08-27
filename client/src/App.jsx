@@ -127,46 +127,62 @@ export default function App() {
     });
 
   }, [handleError]);
+// Socket event handlers
+const setupSocketHandlers = useCallback(() => {
+  socketService.on('match_cancelled', handlePeerDisconnected);
 
-  // Socket event handlers
-  const setupSocketHandlers = useCallback(() => {
-    socketService.on('connect', () => {
-      dev.log('Socket connected');
-      setIsReconnecting(false);
-      setConnectionState(CONNECTION_STATES.WAITING);
-      setStatusMessage('Looking for a chat partner...');
-      setError(null);
-      
-      socketService.emit('find_match');
-    });
+  // Correct usage: provide callback function
+  socketService.on('pong', (data) => {
+    dev.log('Pong received:', data);
+    // You can optionally respond with pong
+    socketService.emit('ping', { timestamp: Date.now() });
+  });
 
-    socketService.on('disconnect', ({ reason, friendlyReason }) => {
-      dev.log('Socket disconnected:', reason);
-      setConnectionState(CONNECTION_STATES.DISCONNECTED);
-      setStatusMessage('Connection lost. Reconnecting...');
-      setIsReconnecting(true);
-    });
+  socketService.on('match_timeout', (data) => {
+    dev.log('Match timeout:', data);
+    setStatusMessage(data?.message || 'No match found, please try again');
+    handlePeerDisconnected();
+  });
 
-    socketService.on('connect_error', (error) => {
-      dev.error('Socket connection error:', error);
-      setConnectionState(CONNECTION_STATES.ERROR);
-      handleError(error, 'socket_connect_error');
-    });
+  socketService.on('match_found', handleMatchFound);
+  socketService.on('webrtc_offer', handleWebRTCOffer);
+  socketService.on('webrtc_answer', handleWebRTCAnswer);
+  socketService.on('webrtc_ice_candidate', handleICECandidate);
+  socketService.on('peer_disconnected', handlePeerDisconnected);
+  socketService.on('rate_limited', handleRateLimited);
 
-    socketService.on('match_found', handleMatchFound);
-    socketService.on('webrtc_offer', handleWebRTCOffer);
-    socketService.on('webrtc_answer', handleWebRTCAnswer);
-    socketService.on('webrtc_ice_candidate', handleICECandidate);
-    socketService.on('peer_disconnected', handlePeerDisconnected);
-    socketService.on('rate_limited', handleRateLimited);
-    socketService.on('message', (data) => addMessage(MESSAGE_TYPES.STRANGER, data));
+  socketService.on('message', (data) => addMessage(MESSAGE_TYPES.STRANGER, data));
 
-    socketService.on('waiting', () => {
-      setConnectionState(CONNECTION_STATES.WAITING);
-      setStatusMessage('Waiting for partner...');
-    });
+  socketService.on('waiting', () => {
+    setConnectionState(CONNECTION_STATES.WAITING);
+    setStatusMessage('Waiting for partner...');
+  });
 
-  }, [handleError, addMessage]);
+  socketService.on('connect', () => {
+    dev.log('Socket connected');
+    setIsReconnecting(false);
+    setConnectionState(CONNECTION_STATES.WAITING);
+    setStatusMessage('Looking for a chat partner...');
+    setError(null);
+    socketService.emit('find_match');
+  });
+
+  socketService.on('disconnect', ({ reason }) => {
+    dev.log('Socket disconnected:', reason);
+    setConnectionState(CONNECTION_STATES.DISCONNECTED);
+    setStatusMessage('Connection lost. Reconnecting...');
+    setIsReconnecting(true);
+  });
+
+  socketService.on('error', (error) => {
+    dev.error('Socket connection error:', error);
+    setConnectionState(CONNECTION_STATES.ERROR);
+    handleError(error, 'socket_connect_error');
+  });
+}, [handleError, addMessage]);
+
+// Other callbacks remain the same
+
 
   // WebRTC signaling handlers
   const handleMatchFound = useCallback(async ({ roomId, peerInfo }) => {
