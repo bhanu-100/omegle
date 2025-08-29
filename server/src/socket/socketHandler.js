@@ -103,7 +103,7 @@ class SocketHandler {
       // Test service connectivity
       await Promise.all([
         redisService.ping(),
-        kafkaService.ping()
+        kafkaService.checkHealth()
       ]);
       
       logger.info('All services initialized successfully');
@@ -861,7 +861,7 @@ class SocketHandler {
     try {
       const [redisHealth, kafkaHealth, matchmakingHealth] = await Promise.all([
         redisService.ping(),
-        kafkaService.ping(),
+        kafkaService.checkHealth(),
         matchmakingService.getHealthStatus()
       ]);
 

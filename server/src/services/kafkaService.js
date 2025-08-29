@@ -113,7 +113,7 @@ class KafkaService {
         worker: process.pid
       });
       
-      metrics.errorRate.inc({ type: 'kafka_connection', worker: process.pid });
+      // metrics.errorRate.inc({ type: 'kafka_connection', worker: process.pid });
       this.scheduleReconnect();
       throw error;
     }
@@ -188,7 +188,7 @@ class KafkaService {
         worker: process.pid
       });
       
-      metrics.errorRate.inc({ type: 'kafka_batch', worker: process.pid });
+      // metrics.errorRate.inc({ type: 'kafka_batch', worker: process.pid });
 
       // Re-add failed batch to the beginning (with limit to prevent memory leaks)
       if (this.eventBatch.length < this.batchSize * 2) {

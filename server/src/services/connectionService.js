@@ -31,7 +31,7 @@ class ConnectionService {
       await redisService.setSocketMapping(socketId, socketId);
 
       // Update connection metrics
-      metrics.totalConnections.inc({ worker: process.pid });
+      // metrics.totalConnections.inc({ worker: process.pid });
 
       kafkaService.logConnectionEvent('connection_registered', socketId, socketId, {
         timestamp: Date.now()
@@ -46,7 +46,7 @@ class ConnectionService {
         worker: process.pid
       });
 
-      metrics.errorRate.inc({ type: 'connection_registration', worker: process.pid });
+      // metrics.errorRate.inc({ type: 'connection_registration', worker: process.pid });
       throw error;
     }
   }
@@ -58,7 +58,7 @@ class ConnectionService {
         const sessionDuration = Date.now() - connection.connectedAt;
 
         // Update metrics
-        metrics.sessionDuration.observe(sessionDuration / 1000);
+        // metrics.sessionDuration.observe(sessionDuration / 1000);
 
         kafkaService.logConnectionEvent('connection_ended', socketId, connection.socketId, {
           sessionDuration,
@@ -81,7 +81,7 @@ class ConnectionService {
         worker: process.pid
       });
 
-      metrics.errorRate.inc({ type: 'disconnect_handling', worker: process.pid });
+      // metrics.errorRate.inc({ type: 'disconnect_handling', worker: process.pid });
     }
   }
 
@@ -102,7 +102,7 @@ class ConnectionService {
 
     // Check if limit exceeded
     if (requests.length >= this.maxRequestsPerWindow) {
-      metrics.rateLimitHits.inc({ worker: process.pid });
+      // metrics.rateLimitHits.inc({ worker: process.pid });
 
       kafkaService.logEvent('rate_limit_exceeded', {
         socketId,

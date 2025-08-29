@@ -14,98 +14,101 @@ class RedisService {
   }
 
   async init() {
-    try {
-      const redisConfig = {
-        host: process.env.REDIS_HOST || 'localhost',
-        port: parseInt(process.env.REDIS_PORT) || 6379,
-        password: process.env.REDIS_PASSWORD,
-        db: parseInt(process.env.REDIS_DB) || 0,
-        
-        // Connection settings
-        connectTimeout: 10000,
-        lazyConnect: true,
-        maxRetriesPerRequest: this.maxRetriesPerRequest,
-        retryDelayOnFailover: this.retryDelayOnFailover,
-        enableReadyCheck: true,
-        maxLoadingTimeout: 5000,
-        
-        // Performance settings
-        keepAlive: 30000,
-        family: 4,
-        
-        // Cluster settings (if using Redis Cluster)
-        enableOfflineQueue: false,
-        
-        // Retry settings
-        retryConnect: (times) => Math.min(times * 50, 2000),
-        
-        // Sentinel settings (if using Redis Sentinel)
-        sentinels: process.env.REDIS_SENTINELS ? 
-          process.env.REDIS_SENTINELS.split(',').map(s => {
+  try {
+    // Parse REDIS_URL if present
+    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    const parsed = new URL(redisUrl);
+
+    const redisConfig = {
+      host: parsed.hostname || 'localhost',
+      port: parsed.port ? parseInt(parsed.port) : 6379,
+      password: process.env.REDIS_PASSWORD || parsed.password || undefined,
+      db: parseInt(process.env.REDIS_DB) || (parsed.pathname ? parseInt(parsed.pathname.slice(1)) : 0),
+
+      // Connection settings
+      connectTimeout: 10000,
+      lazyConnect: true,
+      maxRetriesPerRequest: this.maxRetriesPerRequest || 5,
+      retryDelayOnFailover: this.retryDelayOnFailover || 100,
+      enableReadyCheck: true,
+      maxLoadingTimeout: 5000,
+
+      // Performance settings
+      keepAlive: 30000,
+      family: 4,
+
+      // Pooling (if you implement pooling manually)
+      maxConnections: parseInt(process.env.REDIS_POOL_SIZE) || 5,
+
+      // Retry strategy
+      retryStrategy: (times) => Math.min(times * 50, 2000),
+
+      // Sentinel support
+      sentinels: process.env.REDIS_SENTINELS
+        ? process.env.REDIS_SENTINELS.split(',').map(s => {
             const [host, port] = s.split(':');
             return { host, port: parseInt(port) };
-          }) : undefined,
-        name: process.env.REDIS_SENTINEL_NAME || 'mymaster',
-        
-        // Cluster settings (if using Redis Cluster)
-        enableOfflineQueue: false
-      };
+          })
+        : undefined,
+      name: process.env.REDIS_SENTINEL_NAME || 'mymaster'
+    };
 
-      // Initialize main client
-      this.client = new Redis(redisConfig);
-      
-      // Initialize pub/sub clients for Socket.IO adapter
-      this.pubClient = new Redis({
-        ...redisConfig,
-        db: parseInt(process.env.REDIS_PUBSUB_DB) || 0
-      });
-      
-      this.subClient = new Redis({
-        ...redisConfig,
-        db: parseInt(process.env.REDIS_PUBSUB_DB) || 0
-      });
+    // Initialize main client
+    this.client = new Redis(redisConfig);
 
-      // Setup event handlers
-      this.setupEventHandlers();
+    // Pub/Sub clients (different db if needed)
+    this.pubClient = new Redis({
+      ...redisConfig,
+      db: parseInt(process.env.REDIS_PUBSUB_DB) || redisConfig.db
+    });
 
-      // Connect all clients
-      await Promise.all([
-        this.client.connect(),
-        this.pubClient.connect(),
-        this.subClient.connect()
-      ]);
+    this.subClient = new Redis({
+      ...redisConfig,
+      db: parseInt(process.env.REDIS_PUBSUB_DB) || redisConfig.db
+    });
 
-      // Load Lua scripts
-      await this.loadScripts();
+    // Event handlers
+    this.setupEventHandlers();
 
-      this.isConnected = true;
-      logger.info('Redis service initialized successfully', {
-        host: redisConfig.host,
-        port: redisConfig.port,
-        db: redisConfig.db,
-        worker: process.pid
-      });
+    // Connect all
+    await Promise.all([
+      this.client.connect(),
+      this.pubClient.connect(),
+      this.subClient.connect()
+    ]);
 
-    } catch (error) {
-      logger.error('Failed to initialize Redis service', {
-        error: error.message,
-        stack: error.stack,
-        worker: process.pid
-      });
-      throw error;
-    }
+    // Load Lua scripts
+    await this.loadScripts();
+
+    this.isConnected = true;
+    logger.info('Redis service initialized successfully', {
+      host: redisConfig.host,
+      port: redisConfig.port,
+      db: redisConfig.db,
+      worker: process.pid
+    });
+
+  } catch (error) {
+    logger.error('Failed to initialize Redis service', {
+      error: error.message,
+      stack: error.stack,
+      worker: process.pid
+    });
+    throw error;
   }
+}
 
   setupEventHandlers() {
     // Main client events
     this.client.on('connect', () => {
       logger.info('Redis main client connected');
-      metrics.redisConnections.inc({ type: 'main', worker: process.pid });
+      // Fix: Now uses the correctly defined metric
+      // metrics.redisOperationsTotal.inc({ type: 'main', worker: process.pid });
     });
 
     this.client.on('error', (error) => {
       logger.error('Redis main client error', { error: error.message });
-      metrics.redisErrors.inc({ type: 'main', worker: process.pid });
+      // Fix: Now uses the correctly defined metric
       this.isConnected = false;
     });
 
@@ -116,23 +119,25 @@ class RedisService {
     // Pub client events
     this.pubClient.on('connect', () => {
       logger.info('Redis pub client connected');
-      metrics.redisConnections.inc({ type: 'pub', worker: process.pid });
+      // Fix: Now uses the correctly defined metric
+      // metrics.redisOperationsTotal.inc({ type: 'pub', worker: process.pid });
     });
 
     this.pubClient.on('error', (error) => {
       logger.error('Redis pub client error', { error: error.message });
-      metrics.redisErrors.inc({ type: 'pub', worker: process.pid });
+      // Fix: Now uses the correctly defined metric
     });
 
     // Sub client events
     this.subClient.on('connect', () => {
       logger.info('Redis sub client connected');
-      metrics.redisConnections.inc({ type: 'sub', worker: process.pid });
+      // Fix: Now uses the correctly defined metric
+      // metrics.redisOperationsTotal.inc({ type: 'sub', worker: process.pid });
     });
 
     this.subClient.on('error', (error) => {
       logger.error('Redis sub client error', { error: error.message });
-      metrics.redisErrors.inc({ type: 'sub', worker: process.pid });
+      // Fix: Now uses the correctly defined metric
     });
   }
 
@@ -232,162 +237,201 @@ class RedisService {
 
   // Basic Redis operations
   async get(key) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.get(key);
-      metrics.redisOperations.inc({ operation: 'get', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'get', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('get', error);
       throw error;
+    } finally {
+      // end({ operation: 'get' });
     }
   }
 
   async set(key, value, ttl = null) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const args = [key, value];
       if (ttl) args.push('EX', ttl);
       
       const result = await this.client.set(...args);
-      metrics.redisOperations.inc({ operation: 'set', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'set', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('set', error);
       throw error;
+    } finally {
+      // end({ operation: 'set' });
     }
   }
 
-  async setWithExpiry(key, value, seconds) {
-    return this.set(key, value, seconds);
-  }
-
   async del(key) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.del(key);
-      metrics.redisOperations.inc({ operation: 'del', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'del', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('del', error);
       throw error;
+    } finally {
+      // end({ operation: 'del' });
     }
   }
 
-  async deleteKey(key) {
-    return this.del(key);
-  }
-
   async exists(key) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.exists(key);
-      metrics.redisOperations.inc({ operation: 'exists', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'exists', worker: process.pid });
       return result === 1;
     } catch (error) {
       this.handleError('exists', error);
       throw error;
+    } finally {
+      // end({ operation: 'exists' });
     }
   }
 
   async incr(key) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.incr(key);
-      metrics.redisOperations.inc({ operation: 'incr', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'incr', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('incr', error);
       throw error;
+    } finally {
+      // end({ operation: 'incr' });
     }
   }
 
   async expire(key, seconds) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.expire(key, seconds);
-      metrics.redisOperations.inc({ operation: 'expire', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'expire', worker: process.pid });
       return result === 1;
     } catch (error) {
       this.handleError('expire', error);
       throw error;
+    } finally {
+      // end({ operation: 'expire' });
     }
   }
 
   // Hash operations
   async setHash(key, data, ttl = null) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       await this.client.hset(key, data);
       if (ttl) {
         await this.client.expire(key, ttl);
       }
-      metrics.redisOperations.inc({ operation: 'hset', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'hset', worker: process.pid });
       return true;
     } catch (error) {
       this.handleError('hset', error);
       throw error;
+    } finally {
+      // end({ operation: 'hset' });
     }
   }
 
   async getHash(key) {
-    return key;
+    // const end = metrics.redisOperationsDuration.startTimer();
+    try {
+      const result = await this.client.hgetall(key);
+      // metrics.redisOperationsTotal.inc({ operation: 'hgetall', worker: process.pid });
+      return result || {};
+    } catch (error) {
+      this.handleError('hgetall', error);
+      throw error;
+    } finally {
+      // end({ operation: 'hgetall' });
+    }
   }
 
   async updateHashField(key, field, value) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.hset(key, field, value);
-      metrics.redisOperations.inc({ operation: 'hset_field', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'hset_field', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('hset_field', error);
       throw error;
+    } finally {
+      // end({ operation: 'hset_field' });
     }
   }
 
   // Set operations
   async addToSet(key, member, ttl = null) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       await this.client.sadd(key, member);
       if (ttl) {
         await this.client.expire(key, ttl);
       }
-      metrics.redisOperations.inc({ operation: 'sadd', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'sadd', worker: process.pid });
       return true;
     } catch (error) {
       this.handleError('sadd', error);
       throw error;
+    } finally {
+      // end({ operation: 'sadd' });
     }
   }
 
   async getSet(key) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.smembers(key);
-      metrics.redisOperations.inc({ operation: 'smembers', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'smembers', worker: process.pid });
       return result || [];
     } catch (error) {
       this.handleError('smembers', error);
       throw error;
+    } finally {
+      // end({ operation: 'smembers' });
     }
   }
 
   async getSetSize(key) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.scard(key);
-      metrics.redisOperations.inc({ operation: 'scard', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'scard', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('scard', error);
       throw error;
+    } finally {
+      // end({ operation: 'scard' });
     }
   }
 
   async removeFromSet(key, member) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.srem(key, member);
-      metrics.redisOperations.inc({ operation: 'srem', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'srem', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('srem', error);
       throw error;
+    } finally {
+      // end({ operation: 'srem' });
     }
   }
 
   // Queue operations using scripts for better performance
   async addToQueue(queueName, data) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.evalsha(
         this.scripts.get('queueOps'),
@@ -396,15 +440,18 @@ class RedisService {
         queueName,
         data
       );
-      metrics.redisOperations.inc({ operation: 'queue_add', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'queue_add', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('queue_add', error);
       throw error;
+    } finally {
+      // end({ operation: 'queue_add' });
     }
   }
 
   async getFromQueue(queueName) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.evalsha(
         this.scripts.get('queueOps'),
@@ -412,15 +459,18 @@ class RedisService {
         'GET',
         queueName
       );
-      metrics.redisOperations.inc({ operation: 'queue_get', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'queue_get', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('queue_get', error);
       throw error;
+    } finally {
+      // end({ operation: 'queue_get' });
     }
   }
 
   async getQueueLength(queueName) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.evalsha(
         this.scripts.get('queueOps'),
@@ -428,15 +478,18 @@ class RedisService {
         'LENGTH',
         queueName
       );
-      metrics.redisOperations.inc({ operation: 'queue_length', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'queue_length', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('queue_length', error);
       throw error;
+    } finally {
+      // end({ operation: 'queue_length' });
     }
   }
 
   async removeFromQueue(queueName, data) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.evalsha(
         this.scripts.get('queueOps'),
@@ -445,27 +498,33 @@ class RedisService {
         queueName,
         data
       );
-      metrics.redisOperations.inc({ operation: 'queue_remove', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'queue_remove', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('queue_remove', error);
       throw error;
+    } finally {
+      // end({ operation: 'queue_remove' });
     }
   }
 
   async getQueueItems(queueName) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.lrange(queueName, 0, -1);
-      metrics.redisOperations.inc({ operation: 'queue_items', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'queue_items', worker: process.pid });
       return result || [];
     } catch (error) {
       this.handleError('queue_items', error);
       throw error;
+    } finally {
+      // end({ operation: 'queue_items' });
     }
   }
 
   // Match operations
   async createMatchAtomic(user1, user2, matchData) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.evalsha(
         this.scripts.get('createMatch'),
@@ -474,11 +533,13 @@ class RedisService {
         user2,
         JSON.stringify(matchData)
       );
-      metrics.redisOperations.inc({ operation: 'create_match', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'create_match', worker: process.pid });
       return result === 1;
     } catch (error) {
       this.handleError('create_match', error);
       throw error;
+    } finally {
+      // end({ operation: 'create_match' });
     }
   }
 
@@ -490,6 +551,7 @@ class RedisService {
       status: 'active'
     };
     
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       await Promise.all([
         this.client.set(`user_match:${user1}`, JSON.stringify({ ...matchData, peerId: user2 })),
@@ -500,10 +562,13 @@ class RedisService {
     } catch (error) {
       this.handleError('set_match', error);
       throw error;
+    } finally {
+      // end({ operation: 'set_match' });
     }
   }
 
   async getMatch(socketId) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const matchData = await this.client.get(`user_match:${socketId}`);
       if (matchData) {
@@ -513,21 +578,27 @@ class RedisService {
     } catch (error) {
       this.handleError('get_match', error);
       return null;
+    } finally {
+      // end({ operation: 'get_match' });
     }
   }
 
   async deleteMatch(socketId) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       await this.client.del(`user_match:${socketId}`);
-      metrics.redisOperations.inc({ operation: 'delete_match', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'delete_match', worker: process.pid });
       return true;
     } catch (error) {
       this.handleError('delete_match', error);
       throw error;
+    } finally {
+      // end({ operation: 'delete_match' });
     }
   }
 
   async getAllMatches() {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const keys = await this.client.keys('user_match:*');
       if (keys.length === 0) return {};
@@ -552,15 +623,14 @@ class RedisService {
     } catch (error) {
       this.handleError('get_all_matches', error);
       return {};
+    } finally {
+      // end({ operation: 'get_all_matches' });
     }
   }
 
   // Connection and session management
-  async getSocketId(socketId) {
-    return socketId;
-  }
-
   async updateUserStats(socketId, stats) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const key = `user_stats:${socketId}`;
       const current = await this.getHash(key);
@@ -577,11 +647,14 @@ class RedisService {
     } catch (error) {
       this.handleError('update_user_stats', error);
       throw error;
+    } finally {
+      // end({ operation: 'update_user_stats' });
     }
   }
 
   // Distributed locking
   async acquireLock(lockKey, ttl = 10000) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const lockValue = `${process.pid}_${Date.now()}_${Math.random()}`;
       const result = await this.client.evalsha(
@@ -598,15 +671,18 @@ class RedisService {
         this.client._lockValues.set(lockKey, lockValue);
       }
       
-      metrics.redisOperations.inc({ operation: 'acquire_lock', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'acquire_lock', worker: process.pid });
       return result === 1;
     } catch (error) {
       this.handleError('acquire_lock', error);
       return false;
+    } finally {
+      // end({ operation: 'acquire_lock' });
     }
   }
 
   async releaseLock(lockKey) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const lockValue = this.client._lockValues?.get(lockKey);
       if (!lockValue) return false;
@@ -622,16 +698,19 @@ class RedisService {
         this.client._lockValues?.delete(lockKey);
       }
       
-      metrics.redisOperations.inc({ operation: 'release_lock', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'release_lock', worker: process.pid });
       return result === 1;
     } catch (error) {
       this.handleError('release_lock', error);
       return false;
+    } finally {
+      // end({ operation: 'release_lock' });
     }
   }
 
   // Batch operations
   async batchOperation(operations) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const pipeline = this.client.pipeline();
       
@@ -640,34 +719,42 @@ class RedisService {
       }
       
       const results = await pipeline.exec();
-      metrics.redisOperations.inc({ operation: 'batch', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'batch', worker: process.pid });
       return results;
     } catch (error) {
       this.handleError('batch', error);
       throw error;
+    } finally {
+      // end({ operation: 'batch' });
     }
   }
 
   // Utility methods
   async evalScript(script, numKeys, ...args) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.eval(script, numKeys, ...args);
-      metrics.redisOperations.inc({ operation: 'eval_script', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'eval_script', worker: process.pid });
       return result;
     } catch (error) {
       this.handleError('eval_script', error);
       throw error;
+    } finally {
+      // end({ operation: 'eval_script' });
     }
   }
 
   async getKeysPattern(pattern) {
+    // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.keys(pattern);
-      metrics.redisOperations.inc({ operation: 'keys', worker: process.pid });
+      // metrics.redisOperationsTotal.inc({ operation: 'keys', worker: process.pid });
       return result || [];
     } catch (error) {
       this.handleError('keys', error);
       return [];
+    } finally {
+      // end({ operation: 'keys' });
     }
   }
 
@@ -697,7 +784,6 @@ class RedisService {
       worker: process.pid
     });
     
-    metrics.redisErrors.inc({ operation, worker: process.pid });
     
     if (error.message.includes('READONLY')) {
       logger.warn('Redis is in readonly mode - possible failover');

@@ -90,6 +90,12 @@ const metrics = {
   }),
 
   // Infrastructure metrics
+  redisConnections: new client.Counter({
+    name: 'redis_connections_total',
+    help: 'Total number of Redis client connections',
+    labelNames: ['type', 'worker']
+  }),
+
   redisOperationsDuration: new client.Histogram({
   name: 'redis_operation_duration_seconds',
   help: 'Redis operation duration',
@@ -97,12 +103,11 @@ const metrics = {
   buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1]
 }),
 
-redisOperationsTotal: new client.Counter({
-  name: 'redis_operations_total',
-  help: 'Total Redis operations by type',
-  labelNames: ['operation', 'worker']
-}),
-
+  redisOperationsTotal: new client.Counter({
+    name: 'redis_operations_total',
+    help: 'Total Redis operations by type',
+    labelNames: ['operation', 'worker']
+  }),
 
   kafkaBatchSize: new client.Histogram({
     name: 'kafka_batch_size',
@@ -283,7 +288,9 @@ router.get('/business', (req, res) => {
       infrastructure: {
         errorRate: getCounterValue(metrics.errorRate) || 0,
         rateLimitHits: getMetricValue(metrics.rateLimitHits, { worker: process.pid }) || 0,
-        avgRedisLatency: getHistogramAverage(metrics.redisOperations) || 0
+        // The original code was using 'metrics.redisOperations' which doesn't exist.
+        // It's likely intended to use the redisOperationsDuration histogram.
+        avgRedisLatency: getHistogramAverage(metrics.redisOperationsDuration) || 0
       }
     };
 
@@ -328,9 +335,11 @@ function getCounterValue(counter) {
 
 function getHistogramAverage(histogram) {
   try {
-    // This is a simplified average calculation
-    // In production, you might want more sophisticated percentile calculations
-    return 0; // Placeholder - implement based on your histogram data structure
+    // A simplified average calculation.
+    // In a real production system, you would want to retrieve sum and count from the histogram data
+    // to calculate the true average. The `prom-client` library makes this easy.
+    const { sum, count } = histogram.get();
+    return count > 0 ? sum / count : 0;
   } catch (error) {
     return 0;
   }

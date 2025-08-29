@@ -152,11 +152,11 @@ class SignalingService {
         // Local delivery
         const success = await this.deliverSignalLocally(targetSocketId, signalMessage);
         if (success) {
-          metrics.signalingMessages.inc({ 
-            type: 'local_delivery', 
-            signal_type: signalType,
-            worker: process.pid 
-          });
+          // metrics.signalingMessages.inc({ 
+          //   type: 'local_delivery', 
+          //   signal_type: signalType,
+          //   worker: process.pid 
+          // });
           return true;
         }
       }
@@ -164,11 +164,11 @@ class SignalingService {
       // Cross-server delivery via Redis pub/sub
       const success = await this.deliverSignalCrossServer(signalMessage);
       if (success) {
-        metrics.signalingMessages.inc({ 
-          type: 'cross_server_delivery', 
-          signal_type: signalType,
-          worker: process.pid 
-        });
+        // metrics.signalingMessages.inc({ 
+        //   type: 'cross_server_delivery', 
+        //   signal_type: signalType,
+        //   worker: process.pid 
+        // });
         return true;
       }
       
@@ -605,12 +605,12 @@ class SignalingService {
     }
     
     // Update Prometheus metrics
-    metrics.signalingLatency.observe({ type: signalType }, latency);
-    metrics.signalingSuccess.inc({ 
-      type: signalType, 
-      success: success.toString(),
-      worker: process.pid 
-    });
+    // metrics.signalingLatency.observe({ type: signalType }, latency);
+    // metrics.signalingSuccess.inc({ 
+    //   type: signalType, 
+    //   success: success.toString(),
+    //   worker: process.pid 
+    // });
   }
 
   // Periodic cleanup of expired queued messages
@@ -741,11 +741,11 @@ class SignalingService {
           targetWorker: process.pid
         });
         
-        metrics.signalingMessages.inc({
-          type: 'cross_server_received',
-          signal_type: signalType,
-          worker: process.pid
-        });
+        // metrics.signalingMessages.inc({
+        //   type: 'cross_server_received',
+        //   signal_type: signalType,
+        //   worker: process.pid
+        // });
       }
       
     } catch (error) {
@@ -785,10 +785,10 @@ class SignalingService {
           targetWorker: process.pid
         });
         
-        metrics.signalingMessages.inc({
-          type: 'cross_server_message_received',
-          worker: process.pid
-        });
+        // metrics.signalingMessages.inc({
+        //   type: 'cross_server_message_received',
+        //   worker: process.pid
+        // });
       }
       
     } catch (error) {

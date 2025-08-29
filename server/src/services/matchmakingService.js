@@ -36,7 +36,7 @@ class MatchmakingService {
   }
 
   async findMatch(socket, socketId, io, preferences = {}) {
-    const matchTimer = metrics.matchmakingDuration.startTimer();
+    // const matchTimer = metrics.matchmakingDuration.startTimer();
     const lockKey = `match_lock:${socketId}`;
     
     try {
@@ -135,7 +135,7 @@ class MatchmakingService {
         worker: process.pid
       });
       
-      metrics.errorRate.inc({ type: 'matchmaking', worker: process.pid });
+      // metrics.errorRate.inc({ type: 'matchmaking', worker: process.pid });
       socket.emit('error', {
         type: 'matchmaking_error',
         message: 'Failed to find match, please try again'
@@ -312,10 +312,10 @@ class MatchmakingService {
     await redisService.addToQueue(queueName, JSON.stringify(queueData));
     
     // Update queue metrics
-    metrics.queueSize.set(
-      { queue: queueName.split(':').pop(), worker: process.pid },
-      await redisService.getQueueLength(queueName)
-    );
+    // metrics.queueSize.set(
+    //   { queue: queueName.split(':').pop(), worker: process.pid },
+    //   await redisService.getQueueLength(queueName)
+    // );
 
     // Store queue position for user
     await redisService.setWithExpiry(`queue_position:${socketId}`, queueName, 300);
@@ -489,8 +489,8 @@ class MatchmakingService {
       ]);
 
       // Update metrics
-      metrics.activeMatches.inc({ worker: process.pid });
-      metrics.matchmakingSuccess.inc({ worker: process.pid });
+      // metrics.activeMatches.inc({ worker: process.pid });
+      // metrics.matchmakingSuccess.inc({ worker: process.pid });
 
       // Update user stats
       await Promise.all([
@@ -520,7 +520,7 @@ class MatchmakingService {
         worker: process.pid
       });
       
-      metrics.errorRate.inc({ type: 'match_creation', worker: process.pid });
+      // metrics.errorRate.inc({ type: 'match_creation', worker: process.pid });
       return false;
     } finally {
       await redisService.releaseLock(matchLock);
@@ -674,8 +674,8 @@ class MatchmakingService {
 
           // Update metrics
           const matchDuration = Date.now() - matchData.createdAt;
-          metrics.activeMatches.dec({ worker: process.pid });
-          metrics.matchDuration.observe(matchDuration / 1000);
+          // metrics.activeMatches.dec({ worker: process.pid });
+          // metrics.matchDuration.observe(matchDuration / 1000);
           
           kafkaService.logMatchmakingEvent('match_ended', socketId, peerId, matchData.roomId, {
             duration: matchDuration,
@@ -703,7 +703,7 @@ class MatchmakingService {
         worker: process.pid
       });
       
-      metrics.errorRate.inc({ type: 'disconnect_handling', worker: process.pid });
+      // metrics.errorRate.inc({ type: 'disconnect_handling', worker: process.pid });
     }
   }
 
