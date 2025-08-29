@@ -17,8 +17,7 @@ app.use(helmet({
 
 // CORS configuration
 app.use(cors({
-  // origin: process.env.CLIENT_URL || '*',
-  origin: '*',
+  origin: process.env.CLIENT_URL || '*',
   methods: ['GET', 'POST'],
   credentials: false,
   optionsSuccessStatus: 200

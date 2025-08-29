@@ -2,16 +2,7 @@ require('dotenv').config();
 const cluster = require('cluster');
 const os = require('os');
 const logger = require('./utils/logger');
-const { gracefulShutdown ,setupGracefulShutdown} = require('./utils/shutdown');
-
-// Environment validation
-const requiredEnvVars = ['REDIS_URL'];
-requiredEnvVars.forEach(envVar => {
-  if (!process.env[envVar]) {
-    logger.error(`Missing required environment variable: ${envVar}`);
-    process.exit(1);
-  }
-});
+const {setupGracefulShutdown} = require('./utils/shutdown');
 
 const {
   NODE_ENV = 'development',
