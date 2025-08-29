@@ -90,12 +90,19 @@ const metrics = {
   }),
 
   // Infrastructure metrics
-  redisOperations: new client.Histogram({
-    name: 'redis_operation_duration_seconds',
-    help: 'Redis operation duration',
-    labelNames: ['operation'],
-    buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1]
-  }),
+  redisOperationsDuration: new client.Histogram({
+  name: 'redis_operation_duration_seconds',
+  help: 'Redis operation duration',
+  labelNames: ['operation'],
+  buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1]
+}),
+
+redisOperationsTotal: new client.Counter({
+  name: 'redis_operations_total',
+  help: 'Total Redis operations by type',
+  labelNames: ['operation', 'worker']
+}),
+
 
   kafkaBatchSize: new client.Histogram({
     name: 'kafka_batch_size',
@@ -181,7 +188,8 @@ const businessMetrics = {
   },
 
   recordRedisOperation: (operation, durationSeconds) => {
-    metrics.redisOperations.observe({ operation }, durationSeconds);
+    metrics.redisOperationsDuration.observe({ operation }, durationSeconds);
+    metrics.redisOperationsTotal.inc({ operation, worker: process.pid });
   },
 
   recordKafkaBatch: (batchSize) => {
