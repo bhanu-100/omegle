@@ -47,13 +47,13 @@ router.get('/', async (req, res) => {
     health.responseTime = `${responseTime.toFixed(2)}ms`;
 
     // Basic metrics
-    health.metrics = {
-      activeConnections: metrics.activeConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
-      totalConnections: metrics.totalConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
-      activeMatches: metrics.activeMatches._hashMap.get(`worker:${process.pid}`)?.value || 0,
-      errorCount: Array.from(metrics.errorRate._hashMap.values())
-        .reduce((sum, entry) => sum + (entry.value || 0), 0)
-    };
+    // health.metrics = {
+    //   activeConnections: metrics.activeConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
+    //   totalConnections: metrics.totalConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
+    //   activeMatches: metrics.activeMatches._hashMap.get(`worker:${process.pid}`)?.value || 0,
+    //   errorCount: Array.from(metrics.errorRate._hashMap.values())
+    //     .reduce((sum, entry) => sum + (entry.value || 0), 0)
+    // };
 
     const statusCode = health.status === 'UP' ? 200 : 
                       health.status === 'DEGRADED' ? 200 : 503;
@@ -158,25 +158,25 @@ router.get('/detailed', async (req, res) => {
     }
 
     // Detailed metrics
-    detailedHealth.metrics = {
-      connections: {
-        active: metrics.activeConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
-        total: metrics.totalConnections._hashMap.get(`worker:${process.pid}`)?.value || 0
-      },
-      matches: {
-        active: metrics.activeMatches._hashMap.get(`worker:${process.pid}`)?.value || 0,
-        successful: metrics.matchmakingSuccess._hashMap.get(`worker:${process.pid}`)?.value || 0
-      },
-      signaling: {
-        messages: Array.from(metrics.signalingMessages._hashMap.values())
-          .reduce((sum, entry) => sum + (entry.value || 0), 0)
-      },
-      errors: {
-        total: Array.from(metrics.errorRate._hashMap.values())
-          .reduce((sum, entry) => sum + (entry.value || 0), 0),
-        rateLimitHits: metrics.rateLimitHits._hashMap.get(`worker:${process.pid}`)?.value || 0
-      }
-    };
+    // detailedHealth.metrics = {
+    //   connections: {
+    //     active: metrics.activeConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
+    //     total: metrics.totalConnections._hashMap.get(`worker:${process.pid}`)?.value || 0
+    //   },
+    //   matches: {
+    //     active: metrics.activeMatches._hashMap.get(`worker:${process.pid}`)?.value || 0,
+    //     successful: metrics.matchmakingSuccess._hashMap.get(`worker:${process.pid}`)?.value || 0
+    //   },
+    //   signaling: {
+    //     messages: Array.from(metrics.signalingMessages._hashMap.values())
+    //       .reduce((sum, entry) => sum + (entry.value || 0), 0)
+    //   },
+    //   errors: {
+    //     total: Array.from(metrics.errorRate._hashMap.values())
+    //       .reduce((sum, entry) => sum + (entry.value || 0), 0),
+    //     rateLimitHits: metrics.rateLimitHits._hashMap.get(`worker:${process.pid}`)?.value || 0
+    //   }
+    // };
 
     const statusCode = detailedHealth.status === 'UP' ? 200 : 
                       detailedHealth.status === 'DEGRADED' ? 200 : 503;
@@ -328,13 +328,13 @@ router.get('/connections', async (req, res) => {
         queues: matchmakingStats,
         activeMatches: matchmakingStats.activeMatches
       },
-      metrics: {
-        totalConnectionsAllTime: metrics.totalConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
-        currentActive: metrics.activeConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
-        totalMatches: metrics.matchmakingSuccess._hashMap.get(`worker:${process.pid}`)?.value || 0,
-        totalSignalingMessages: Array.from(metrics.signalingMessages._hashMap.values())
-          .reduce((sum, entry) => sum + (entry.value || 0), 0)
-      }
+      // metrics: {
+      //   totalConnectionsAllTime: metrics.totalConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
+      //   currentActive: metrics.activeConnections._hashMap.get(`worker:${process.pid}`)?.value || 0,
+      //   totalMatches: metrics.matchmakingSuccess._hashMap.get(`worker:${process.pid}`)?.value || 0,
+      //   totalSignalingMessages: Array.from(metrics.signalingMessages._hashMap.values())
+      //     .reduce((sum, entry) => sum + (entry.value || 0), 0)
+      // }
     };
 
     res.json(stats);

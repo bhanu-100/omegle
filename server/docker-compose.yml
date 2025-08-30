@@ -36,6 +36,7 @@ services:
           memory: 512M
           cpus: '0.5'
     volumes:
+      - ./src:/app/src
       - ./logs:/app/logs
     networks:
       - webrtc-network

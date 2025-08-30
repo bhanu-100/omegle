@@ -267,7 +267,7 @@ class RedisService {
     }
   }
 
-  async del(key) {
+  async deleteKey(key) {
     // const end = metrics.redisOperationsDuration.startTimer();
     try {
       const result = await this.client.del(key);

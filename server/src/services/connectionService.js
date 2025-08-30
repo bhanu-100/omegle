@@ -28,7 +28,7 @@ class ConnectionService {
       });
 
       // Store in Redis
-      await redisService.setSocketMapping(socketId, socketId);
+      // await redisService.setSocketMapping(socketId, socketId);
 
       // Update connection metrics
       // metrics.totalConnections.inc({ worker: process.pid });
@@ -70,7 +70,7 @@ class ConnectionService {
       }
 
       // Remove from Redis
-      await redisService.deleteSocketMapping(socketId);
+      // await redisService.deleteSocketMapping(socketId);
 
       logger.debug('Connection cleanup completed', { socketId, worker: process.pid });
 

@@ -35,8 +35,9 @@ class MatchmakingService {
     this.regions = ['NA', 'EU', 'AS', 'SA', 'OC', 'AF'];
   }
 
-  async findMatch(socket, socketId, io, preferences = {}) {
+  async findMatch(socket, io, preferences = {}) {
     // const matchTimer = metrics.matchmakingDuration.startTimer();
+    const socketId = socket.id;
     const lockKey = `match_lock:${socketId}`;
     
     try {
@@ -93,7 +94,7 @@ class MatchmakingService {
           kafkaService.logMatchmakingEvent('match_found', socketId, matchResult.peerId, roomId, {
             waitTime: 0,
             matchQuality: matchResult.quality,
-            region: preferences.region
+            region: preferences.region||'any',
           });
         } else {
           // Match creation failed, add to queue
@@ -122,7 +123,7 @@ class MatchmakingService {
         logger.debug('User added to matchmaking queue', { 
           socketId, 
           queuePosition, 
-          region: preferences.region,
+          region: preferences.region||'any',
           worker: process.pid 
         });
       }
@@ -183,7 +184,7 @@ class MatchmakingService {
     try {
       const result = await redisService.evalScript(script, 0, 
         socketId, 
-        preferences.region || '', 
+        preferences.region || 'any', 
         preferences.minConnectionQuality || 0
       );
 
@@ -289,7 +290,7 @@ class MatchmakingService {
     const queueData = {
       socketId,
       timestamp: Date.now(),
-      region: preferences.region,
+      region: preferences.region||'any',
       connectionQuality: preferences.connectionQuality || 50,
       retryCount: preferences.retryCount || 0
     };

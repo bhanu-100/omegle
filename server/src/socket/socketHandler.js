@@ -31,10 +31,9 @@ class SocketHandler {
     }
 
     try {
-      // Initialize services with error handling
       await this.initializeServices();
       
-      // Initialize Socket.IO with enhanced configuration
+      // Create Socket.IO instance first
       this.io = socketIo(server, {
         cors: {
           origin: this.getAllowedOrigins(),
@@ -43,7 +42,7 @@ class SocketHandler {
           optionsSuccessStatus: 200
         },
         transports: (process.env.SOCKET_IO_TRANSPORTS || 'websocket,polling').split(','),
-        maxHttpBufferSize: 1e6, // 1MB
+        maxHttpBufferSize: 1e6,
         pingTimeout: parseInt(process.env.SOCKET_IO_PING_TIMEOUT) || 60000,
         pingInterval: parseInt(process.env.SOCKET_IO_PING_INTERVAL) || 25000,
         upgradeTimeout: 10000,
@@ -51,31 +50,22 @@ class SocketHandler {
         cookie: false,
         serveClient: false,
         allowUpgrades: true,
-        perMessageDeflate: true, // Enable compression
+        perMessageDeflate: true,
         httpCompression: true,
-        
-        // Enhanced connection handling
         connectTimeout: 45000,
         destroyUpgrade: false,
         destroyUpgradeTimeout: 1000,
-        
-        // Path configuration
         path: process.env.SOCKET_IO_PATH || '/socket.io/'
       });
 
-      // Setup Redis adapter with error handling
+      // Set up Redis adapter AFTER creating the Socket.IO instance
       await this.setupRedisAdapter();
-
-      // Setup global event handlers
+      
       this.setupGlobalHandlers();
-
-      // Connection handling
       this.io.on('connection', (socket) => this.handleConnection(socket));
-
-      // Start health monitoring
       this.startHealthMonitoring();
-
       this.isInitialized = true;
+      
       logger.info('Socket.IO initialized successfully', { 
         worker: process.pid,
         transports: this.io.engine.transports,
@@ -87,6 +77,51 @@ class SocketHandler {
       logger.error('Failed to initialize Socket.IO', {
         error: error.message,
         stack: error.stack,
+        worker: process.pid
+      });
+      throw error;
+    }
+  }
+
+  async setupRedisAdapter() {
+    try {
+      const { pubClient, subClient } = redisService.getClients();
+      
+      // Test Redis connections
+      await Promise.all([
+        pubClient.ping(),
+        subClient.ping()
+      ]);
+      
+      // Create the adapter constructor function
+      const adapterConstructor = createAdapter(pubClient, subClient, {
+        key: process.env.REDIS_ADAPTER_KEY || 'socket.io',
+        requestsTimeout: 5000,
+        publishOnSpecificResponseChannel: true,
+        parser: {
+          encode: JSON.stringify,
+          decode: JSON.parse
+        }
+      });
+
+      // Set the adapter on the Socket.IO instance
+      this.io.adapter(adapterConstructor);
+
+      // Set up error handling on the adapter instance
+      // The adapter instance is created when we call this.io.adapter()
+      this.io.of('/').adapter.on('error', (error) => {
+        logger.error('Redis adapter error', {
+          error: error.message,
+          worker: process.pid
+        });
+        metrics.errorRate.inc({ type: 'redis_adapter', worker: process.pid });
+      });
+
+      logger.info('Redis adapter configured successfully');
+      
+    } catch (error) {
+      logger.error('Redis adapter setup failed', {
+        error: error.message,
         worker: process.pid
       });
       throw error;
@@ -124,45 +159,6 @@ class SocketHandler {
     }
     
     return origins.split(',').map(origin => origin.trim());
-  }
-
-  async setupRedisAdapter() {
-    try {
-      const { pubClient, subClient } = redisService.getClients();
-      
-      // Test Redis connections
-      await Promise.all([
-        pubClient.ping(),
-        subClient.ping()
-      ]);
-      
-      this.io.adapter(createAdapter(pubClient, subClient, {
-        key: process.env.REDIS_ADAPTER_KEY || 'socket.io',
-        requestsTimeout: 5000,
-        publishOnSpecificResponseChannel: true,
-        parser: {
-          encode: JSON.stringify,
-          decode: JSON.parse
-        }
-      }));
-
-      // Handle adapter errors
-      this.io.adapter.on('error', (error) => {
-        logger.error('Redis adapter error', {
-          error: error.message,
-          worker: process.pid
-        });
-        metrics.errorRate.inc({ type: 'redis_adapter', worker: process.pid });
-      });
-
-      logger.info('Redis adapter configured successfully');
-    } catch (error) {
-      logger.error('Redis adapter setup failed', {
-        error: error.message,
-        worker: process.pid
-      });
-      throw error;
-    }
   }
 
   setupGlobalHandlers() {
@@ -334,10 +330,9 @@ class SocketHandler {
 
   setupEventHandlers(socket) {
     const socketId = socket.id;
-    const connectionInfo = this.activeConnections.get(socketId);
     
     // Enhanced matchmaking with preferences
-    socket.on('find_match', async (data = {}) => {
+    socket.on('find_match', async () => {
       try {
         if (await this.isRateLimited(socketId, 'matchmaking')) {
           socket.emit('rate_limited', { 
@@ -352,13 +347,12 @@ class SocketHandler {
         
         // Extract user preferences
         const preferences = {
-          region: data.region,
-          language: data.language,
-          connectionQuality: data.connectionQuality || 50,
-          acceptedLanguages: data.acceptedLanguages || [],
-          minConnectionQuality: data.minConnectionQuality || 0
+          region: 'any',
+          language: 'any',
+          connectionQuality: 50,
+          acceptedLanguages: [],
+          minConnectionQuality: 0
         };
-
         await matchmakingService.findMatch(socket, this.io, preferences);
         
       } catch (error) {
@@ -520,7 +514,7 @@ class SocketHandler {
             timestamp: Date.now()
           }, 300); // 5 minutes TTL
 
-          metrics.connectionQuality.observe(data.rtt || 0);
+          // metrics.connectionQuality.observe(data.rtt || 0);
           
           kafkaService.logEvent('connection_quality', {
             socketId,
@@ -702,9 +696,9 @@ class SocketHandler {
       ]);
 
       // Update metrics
-      metrics.activeConnections.dec({ worker: process.pid });
-      metrics.signalingMessages.inc({ type: 'disconnect', worker: process.pid });
-      metrics.disconnectDuration.observe((Date.now() - disconnectStart) / 1000);
+      // metrics.activeConnections.dec({ worker: process.pid });
+      // metrics.signalingMessages.inc({ type: 'disconnect', worker: process.pid });
+      // metrics.disconnectDuration.observe((Date.now() - disconnectStart) / 1000);
 
       // Remove from active connections
       this.activeConnections.delete(socketId);
@@ -787,19 +781,19 @@ class SocketHandler {
   }
 
   updateServerMetrics() {
-    metrics.activeConnections.set({ worker: process.pid }, this.activeConnections.size);
+    // metrics.activeConnections.set({ worker: process.pid }, this.activeConnections.size);
     
     // Memory usage
     const memUsage = process.memoryUsage();
-    metrics.memoryUsage.set({ type: 'rss', worker: process.pid }, memUsage.rss);
-    metrics.memoryUsage.set({ type: 'heapUsed', worker: process.pid }, memUsage.heapUsed);
-    metrics.memoryUsage.set({ type: 'heapTotal', worker: process.pid }, memUsage.heapTotal);
+    // metrics.memoryUsage.set({ type: 'rss', worker: process.pid }, memUsage.rss);
+    // metrics.memoryUsage.set({ type: 'heapUsed', worker: process.pid }, memUsage.heapUsed);
+    // metrics.memoryUsage.set({ type: 'heapTotal', worker: process.pid }, memUsage.heapTotal);
     
     // Event loop lag
     const start = process.hrtime.bigint();
     setImmediate(() => {
       const lag = Number(process.hrtime.bigint() - start) / 1e6; // Convert to milliseconds
-      metrics.eventLoopLag.set({ worker: process.pid }, lag);
+      // metrics.eventLoopLag.set({ worker: process.pid }, lag);
     });
   }
 
