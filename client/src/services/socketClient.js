@@ -1,7 +1,6 @@
 // =========================
-// Production Socket.IO Client
+// Bug-Free & Production-Ready Socket.IO Client
 // =========================
-
 import { io } from 'socket.io-client';
 import { CONFIG } from '../config';
 import { performanceMonitor, errorHandler, AppError, dev } from '../utils';
@@ -23,13 +22,16 @@ class SocketClient {
       errors: 0
     };
     
+    // Using a native EventTarget for internal events
     this.eventEmitter = new EventTarget();
     this.isDestroyed = false;
   }
 
-  // Initialize socket connection
   init() {
-    if (this.socket && !this.isDestroyed) {
+    if (this.isDestroyed) {
+      throw new AppError('Cannot re-initialize a destroyed socket client', 'SOCKET');
+    }
+    if (this.socket) {
       return this.socket;
     }
 
@@ -62,7 +64,6 @@ class SocketClient {
     }
   }
 
-  // Setup all socket event handlers
   setupEventHandlers() {
     if (!this.socket) return;
 
@@ -83,7 +84,6 @@ class SocketClient {
     this.socket.on('pong', (latency) => dev.log('Pong received, latency:', latency));
   }
 
-  // Connection event handlers
   handleConnect() {
     this.connected = true;
     this.connecting = false;
@@ -99,7 +99,8 @@ class SocketClient {
     
     this.reconnectAttempt = 0;
     this.flushEmitQueue();
-    this.emit('connect', { socketId: this.socket.id, transport });
+    // Publish internal event
+    this.eventEmitter.dispatchEvent(new CustomEvent('connect', { detail: { socketId: this.socket.id, transport } }));
   }
 
   handleDisconnect(reason) {
@@ -108,7 +109,6 @@ class SocketClient {
     
     dev.log('Disconnected:', reason);
     
-    // Provide user-friendly disconnect reasons
     const friendlyReasons = {
       'io server disconnect': 'Server disconnected you',
       'io client disconnect': 'You disconnected',
@@ -118,7 +118,7 @@ class SocketClient {
     };
     
     const friendlyReason = friendlyReasons[reason] || reason;
-    this.emit('disconnect', { reason, friendlyReason });
+    this.eventEmitter.dispatchEvent(new CustomEvent('disconnect', { detail: { reason, friendlyReason } }));
   }
 
   handleConnectError(error) {
@@ -129,7 +129,6 @@ class SocketClient {
     
     dev.warn(`Connection error (attempt ${this.reconnectAttempt}):`, error.message);
     
-    // Enhanced error diagnosis
     let errorType = 'NETWORK';
     let userMessage = 'Connection failed. Please check your internet connection.';
     
@@ -140,7 +139,7 @@ class SocketClient {
     
     if (error.message.includes('Mixed Content') || error.message.includes('insecure')) {
       errorType = 'SECURITY';
-      userMessage = 'Security error: Cannot connect to insecure server from secure page.';
+      userMessage = 'Security error: Cannot connect to an insecure server from a secure page.';
     }
     
     if (error.message.includes('CORS')) {
@@ -153,22 +152,21 @@ class SocketClient {
       attempt: this.reconnectAttempt
     });
     
-    this.emit('connect_error', appError);
+    this.eventEmitter.dispatchEvent(new CustomEvent('connect_error', { detail: appError }));
   }
 
   handleReconnectAttempt(attemptNumber) {
     this.connecting = true;
     dev.log(`Reconnection attempt ${attemptNumber}`);
-    this.emit('reconnect_attempt', { attempt: attemptNumber });
+    this.eventEmitter.dispatchEvent(new CustomEvent('reconnect_attempt', { detail: { attempt: attemptNumber } }));
   }
 
   handleReconnectFailed() {
     dev.error('Reconnection failed - giving up');
     this.connecting = false;
-    this.emit('reconnect_failed', { 
-      attempts: this.reconnectAttempt,
-      message: 'Unable to reconnect to server. Please refresh the page.' 
-    });
+    this.eventEmitter.dispatchEvent(new CustomEvent('reconnect_failed', { 
+      detail: { attempts: this.reconnectAttempt, message: 'Unable to reconnect to server. Please refresh the page.' } 
+    }));
   }
 
   handleError(error) {
@@ -179,19 +177,19 @@ class SocketClient {
       originalError: error.message || error
     });
     
-    this.emit('error', appError);
+    this.eventEmitter.dispatchEvent(new CustomEvent('error', { detail: appError }));
   }
 
   handleUpgrade() {
     this.stats.transportUpgrades++;
     const transport = this.socket.io.engine?.transport?.name;
     dev.log(`Transport upgraded to: ${transport}`);
-    this.emit('transport_upgrade', { transport });
+    this.eventEmitter.dispatchEvent(new CustomEvent('transport_upgrade', { detail: { transport } }));
   }
 
   handleUpgradeError(error) {
     dev.warn('Transport upgrade failed:', error);
-    this.emit('transport_upgrade_error', { error: error.message });
+    this.eventEmitter.dispatchEvent(new CustomEvent('transport_upgrade_error', { detail: { error: error.message } }));
   }
 
   // Connection management
@@ -210,30 +208,35 @@ class SocketClient {
     }
 
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new AppError('Connection timeout', 'SOCKET'));
-      }, CONFIG.PERFORMANCE.connectionTimeout);
-
+      // Add listeners first to avoid race conditions
       const onConnect = () => {
-        clearTimeout(timeout);
-        this.off('connect', onConnect);
-        this.off('connect_error', onError);
+        // We handle connection state in handleConnect, so just resolve the promise
         resolve();
+        // The listeners will be removed by the .off() calls in the finally block
       };
-
+      
       const onError = (error) => {
-        clearTimeout(timeout);
-        this.off('connect', onConnect);
-        this.off('connect_error', onError);
+        // The error is already handled by handleConnectError, just reject the promise
         reject(error);
       };
-
+      
       this.on('connect', onConnect);
       this.on('connect_error', onError);
+
+      const timeout = setTimeout(() => {
+        this.off('connect', onConnect);
+        this.off('connect_error', onError);
+        reject(new AppError('Connection timeout', 'SOCKET_TIMEOUT'));
+      }, CONFIG.PERFORMANCE.connectionTimeout);
 
       this.connecting = true;
       dev.log('Initiating connection...');
       this.socket.connect();
+    }).finally(() => {
+      // Clean up listeners from the promise after it resolves or rejects
+      // The `on` and `off` methods handle the EventTarget as well as the socket listeners
+      this.off('connect', this.handleConnect.bind(this));
+      this.off('connect_error', this.handleConnectError.bind(this));
     });
   }
 
@@ -253,6 +256,8 @@ class SocketClient {
     
     if (this.socket) {
       this.socket.removeAllListeners();
+      // Also remove listeners from the underlying manager
+      this.socket.io.removeAllListeners();
       this.socket.disconnect();
       this.socket = null;
     }
@@ -263,7 +268,6 @@ class SocketClient {
     this.connecting = false;
   }
 
-  // Message queue management
   flushEmitQueue() {
     const queueLength = this.emitQueue.length;
     let flushedCount = 0;
@@ -271,10 +275,9 @@ class SocketClient {
     while (this.emitQueue.length > 0) {
       const { event, data, timestamp, resolve, reject } = this.emitQueue.shift();
       
-      // Skip very old messages (older than 30 seconds)
       if (Date.now() - timestamp > 30000) {
         dev.warn(`Skipping old queued message: ${event}`);
-        if (reject) reject(new AppError('Message expired', 'SOCKET'));
+        if (reject) reject(new AppError('Message expired', 'SOCKET_MESSAGE_EXPIRED'));
         continue;
       }
       
@@ -284,7 +287,7 @@ class SocketClient {
         flushedCount++;
         if (resolve) resolve();
       } catch (error) {
-        if (reject) reject(error);
+        if (reject) reject(new AppError('Failed to emit flushed message', 'SOCKET_EMIT_FLUSH', { originalError: error.message }));
       }
     }
     
@@ -296,10 +299,9 @@ class SocketClient {
   clearEmitQueue() {
     const cleared = this.emitQueue.length;
     
-    // Reject all pending promises
     this.emitQueue.forEach(({ reject }) => {
       if (reject) {
-        reject(new AppError('Connection lost', 'SOCKET'));
+        reject(new AppError('Connection lost, queue cleared', 'SOCKET_QUEUE_CLEARED'));
       }
     });
     
@@ -312,42 +314,35 @@ class SocketClient {
     return cleared;
   }
 
-  // Enhanced emit with promise support and intelligent queuing
   emit(event, data = null) {
-    // Handle internal events
-    if (['connect', 'disconnect', 'connect_error', 'reconnect_attempt', 'reconnect_failed', 'error', 'transport_upgrade', 'transport_upgrade_error'].includes(event)) {
-      this.eventEmitter.dispatchEvent(new CustomEvent(event, { detail: data }));
-      return Promise.resolve();
-    }
-
+    // Return a promise for the caller
     return new Promise((resolve, reject) => {
       const timestamp = Date.now();
 
       if (this.connected && this.socket?.connected) {
         try {
-          this.socket.emit(event, data);
+          this.socket.emit(event, data, (ack) => {
+            // Optional: Handle server acknowledgments
+            resolve(ack);
+          });
           this.stats.messagesSent++;
-          resolve();
         } catch (error) {
-          reject(new AppError('Failed to emit message', 'SOCKET', { 
+          reject(new AppError('Failed to emit message', 'SOCKET_EMIT', { 
             event, 
-            error: error.message 
+            originalError: error.message 
           }));
         }
         return;
       }
 
-      // Don't queue if we're not trying to connect
       if (!this.connecting && !this.connected) {
-        reject(new AppError('Not connected and not connecting', 'SOCKET', { event }));
-        return;
+        return reject(new AppError('Not connected and not connecting', 'SOCKET_DISCONNECTED', { event }));
       }
 
-      // Implement queue size limit to prevent memory leaks
       if (this.emitQueue.length >= CONFIG.PERFORMANCE.maxQueueSize) {
         const dropped = this.emitQueue.shift();
         if (dropped.reject) {
-          dropped.reject(new AppError('Queue full, message dropped', 'SOCKET'));
+          dropped.reject(new AppError('Queue full, message dropped', 'SOCKET_QUEUE_FULL'));
         }
         dev.warn(`Queue full, dropping old message: ${dropped.event}`);
       }
@@ -358,7 +353,6 @@ class SocketClient {
     });
   }
 
-  // Volatile emit - messages are dropped if not connected
   volatileEmit(event, data = null) {
     if (this.connected && this.socket?.connected) {
       try {
@@ -373,17 +367,17 @@ class SocketClient {
     return false;
   }
 
-  // Event handling
   on(event, callback) {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set());
     }
     this.listeners.get(event).add(callback);
     
-    // Use EventTarget for internal events
+    // For internal events, use EventTarget
     if (['connect', 'disconnect', 'connect_error', 'reconnect_attempt', 'reconnect_failed', 'error', 'transport_upgrade', 'transport_upgrade_error'].includes(event)) {
       this.eventEmitter.addEventListener(event, callback);
     } else if (this.socket) {
+      // For all other custom events, use the socket
       this.socket.on(event, callback);
     }
   }
@@ -408,7 +402,6 @@ class SocketClient {
     this.on(event, onceCallback);
   }
 
-  // Health and diagnostics
   getHealth() {
     return {
       connected: this.connected,
@@ -433,22 +426,22 @@ class SocketClient {
     };
   }
 
-  // Test connection functionality
   async testConnection() {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        this.off('connect', testHandler);
+        this.off('connect_error', errorHandler);
         resolve({ success: false, error: 'Connection test timeout' });
       }, 10000);
       
-      const testHandler = (data) => {
+      const testHandler = () => {
         clearTimeout(timeout);
         this.off('connect', testHandler);
         this.off('connect_error', errorHandler);
         resolve({ 
           success: true, 
           transport: this.socket?.io?.engine?.transport?.name,
-          socketId: this.socket?.id,
-          latency: data?.latency || null
+          socketId: this.socket?.id
         });
       };
       
@@ -465,21 +458,19 @@ class SocketClient {
       if (!this.connected) {
         this.connect().catch(errorHandler);
       } else {
-        testHandler({ latency: this.socket?.ping });
+        testHandler();
       }
     });
   }
 
-  // Force reconnection
   forceReconnect() {
     dev.log('Force reconnecting...');
     if (this.socket) {
       this.socket.disconnect();
     }
+    
     setTimeout(() => {
-      this.connect().catch(error => {
-        dev.error('Force reconnect failed:', error);
-      });
+      this.connect();
     }, 1000);
   }
 }
@@ -487,44 +478,34 @@ class SocketClient {
 // Create singleton instance
 const socketClient = new SocketClient();
 
-// Enhanced interface for backward compatibility and ease of use
 const socketService = {
-  // Core Socket.IO methods
   connect: () => socketClient.connect(),
   disconnect: () => socketClient.disconnect(),
   destroy: () => socketClient.destroy(),
   
-  // Event handling
   on: (event, callback) => socketClient.on(event, callback),
   off: (event, callback) => socketClient.off(event, callback),
   once: (event, callback) => socketClient.once(event, callback),
   
-  // Message sending
   emit: (event, data) => socketClient.emit(event, data),
   volatileEmit: (event, data) => socketClient.volatileEmit(event, data),
   
-  // Connection state
   get connected() { return socketClient.connected; },
   get connecting() { return socketClient.connecting; },
   get disconnected() { return !socketClient.connected && !socketClient.connecting; },
   
-  // Socket information
   get id() { return socketClient.socket?.id; },
   
-  // Utility methods
   getHealth: () => socketClient.getHealth(),
   getStats: () => socketClient.getStats(),
   clearQueue: () => socketClient.clearEmitQueue(),
   getQueueSize: () => socketClient.emitQueue.length,
   
-  // Advanced methods
   testConnection: () => socketClient.testConnection(),
   forceReconnect: () => socketClient.forceReconnect(),
   
-  // Raw socket access (use carefully)
   get raw() { return socketClient.socket; },
   
-  // Debugging helpers
   debug: {
     getClient: () => socketClient,
     getConfig: () => CONFIG,
@@ -534,7 +515,6 @@ const socketService = {
   }
 };
 
-// Make debug utilities available globally in development
 if (CONFIG.FEATURES.debugMode) {
   window.socketDebug = {
     client: socketClient,

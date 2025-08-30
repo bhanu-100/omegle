@@ -92,7 +92,7 @@ const stats = {
 };
 
 // Enhanced connection handler
-rawSocket.on('connect', () => {
+rawSocket.on('connection', () => {
   connected = true;
   connecting = false;
   stats.connectTime = Date.now();
