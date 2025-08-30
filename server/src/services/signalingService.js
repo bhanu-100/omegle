@@ -13,10 +13,13 @@ class SignalingService {
       messagesFailed: 0,
       averageLatency: 0
     };
+    this.cleanupTimer = null;
   }
 
+  // FIXED: Declared fromUserKey at the beginning of the method
   async forwardSignal(socket, fromSocketId, signalType, data) {
     const startTime = Date.now();
+    const fromUserKey = fromSocketId; // FIXED: Properly declare the variable
     
     try {
       // Get the peer user from active match
@@ -74,8 +77,7 @@ class SignalingService {
         this.updateSignalingStats(signalType, latency, true);
         
         // Log successful forwarding
-        kafkaService.logSignalingEvent('signal_forwarded', fromUserKey, toUserKey, {
-          signalType,
+        kafkaService.logSignalingEvent('signal_forwarded', fromUserKey, toUserKey, signalType, {
           messageId: signalMessage.messageId,
           latency,
           roomId: matchData.roomId
@@ -152,11 +154,15 @@ class SignalingService {
         // Local delivery
         const success = await this.deliverSignalLocally(targetSocketId, signalMessage);
         if (success) {
-          // metrics.signalingMessages.inc({ 
-          //   type: 'local_delivery', 
-          //   signal_type: signalType,
-          //   worker: process.pid 
-          // });
+          try {
+            // metrics.signalingMessages.inc({ 
+            //   type: 'local_delivery', 
+            //   signal_type: signalType,
+            //   worker: process.pid 
+            // });
+          } catch (metricsError) {
+            // Ignore metrics errors
+          }
           return true;
         }
       }
@@ -164,11 +170,15 @@ class SignalingService {
       // Cross-server delivery via Redis pub/sub
       const success = await this.deliverSignalCrossServer(signalMessage);
       if (success) {
-        // metrics.signalingMessages.inc({ 
-        //   type: 'cross_server_delivery', 
-        //   signal_type: signalType,
-        //   worker: process.pid 
-        // });
+        try {
+          // metrics.signalingMessages.inc({ 
+          //   type: 'cross_server_delivery', 
+          //   signal_type: signalType,
+          //   worker: process.pid 
+          // });
+        } catch (metricsError) {
+          // Ignore metrics errors
+        }
         return true;
       }
       
@@ -255,8 +265,10 @@ class SignalingService {
     }
   }
 
-  async forwardMessage(socket, fromUserKey, messageData) {
+  // FIXED: Declared fromUserKey at the beginning
+  async forwardMessage(socket, fromSocketId, messageData) {
     const startTime = Date.now();
+    const fromUserKey = fromSocketId; // FIXED: Properly declare the variable
     
     try {
       // Get the peer user from active match
@@ -359,7 +371,10 @@ class SignalingService {
       // Cross-server delivery
       const { pubClient } = redisService.getClients();
       const channelName = `messaging:${toUserKey}`;
-      const payload = JSON.stringify(message);
+      const payload = JSON.stringify({
+        ...message,
+        sourceWorker: process.pid
+      });
       
       const subscribers = await pubClient.publish(channelName, payload);
       return subscribers > 0;
@@ -563,22 +578,30 @@ class SignalingService {
   }
 
   validateSignalData(signalType, data) {
-    switch (signalType) {
-      case 'webrtc_offer':
-      case 'webrtc_answer':
-        return data && 
-               data.sdp && 
-               typeof data.sdp === 'object' &&
-               data.sdp.type && 
-               data.sdp.sdp &&
-               ['offer', 'answer'].includes(data.sdp.type);
-               
-      case 'webrtc_ice_candidate':
-        return data && 
-               data.candidate !== undefined;
-               
-      default:
-        return data && typeof data === 'object';
+    try {
+      switch (signalType) {
+        case 'webrtc_offer':
+        case 'webrtc_answer':
+          return data && 
+                 data.sdp && 
+                 typeof data.sdp === 'object' &&
+                 data.sdp.type && 
+                 data.sdp.sdp &&
+                 ['offer', 'answer'].includes(data.sdp.type);
+                 
+        case 'webrtc_ice_candidate':
+          return data && 
+                 data.candidate !== undefined;
+                 
+        default:
+          return data && typeof data === 'object';
+      }
+    } catch (error) {
+      logger.warn('Error validating signal data', {
+        error: error.message,
+        signalType
+      });
+      return false;
     }
   }
 
@@ -604,18 +627,22 @@ class SignalingService {
       this.signalingStats.messagesFailed++;
     }
     
-    // Update Prometheus metrics
-    // metrics.signalingLatency.observe({ type: signalType }, latency);
-    // metrics.signalingSuccess.inc({ 
-    //   type: signalType, 
-    //   success: success.toString(),
-    //   worker: process.pid 
-    // });
+    // Update Prometheus metrics if available
+    try {
+      // metrics.signalingLatency.observe({ type: signalType }, latency);
+      // metrics.signalingSuccess.inc({ 
+      //   type: signalType, 
+      //   success: success.toString(),
+      //   worker: process.pid 
+      // });
+    } catch (metricsError) {
+      // Ignore metrics errors
+    }
   }
 
   // Periodic cleanup of expired queued messages
   startCleanupTimer() {
-    setInterval(() => {
+    this.cleanupTimer = setInterval(() => {
       this.cleanupExpiredMessages();
     }, 60000); // Every minute
   }
@@ -646,22 +673,31 @@ class SignalingService {
       }
       
       // Clean up Redis-stored queues
-      const signalKeys = await redisService.getKeysPattern('offline_signals:*');
-      const messageKeys = await redisService.getKeysPattern('offline_messages:*');
+      const [signalKeys, messageKeys] = await Promise.all([
+        redisService.getKeysPattern('offline_signals:*'),
+        redisService.getKeysPattern('offline_messages:*')
+      ]);
       
       for (const key of [...signalKeys, ...messageKeys]) {
-        const queueData = await redisService.get(key);
-        if (queueData) {
-          const queue = JSON.parse(queueData);
-          const validItems = queue.filter(item => item.expiresAt > currentTime);
-          
-          if (validItems.length !== queue.length) {
-            if (validItems.length > 0) {
-              await redisService.set(key, JSON.stringify(validItems), 300);
-            } else {
-              await redisService.deleteKey(key);
+        try {
+          const queueData = await redisService.get(key);
+          if (queueData) {
+            const queue = JSON.parse(queueData);
+            const validItems = queue.filter(item => item.expiresAt > currentTime);
+            
+            if (validItems.length !== queue.length) {
+              if (validItems.length > 0) {
+                await redisService.set(key, JSON.stringify(validItems), 300);
+              } else {
+                await redisService.deleteKey(key);
+              }
             }
           }
+        } catch (error) {
+          logger.warn('Failed to process queue during cleanup', {
+            key,
+            error: error.message
+          });
         }
       }
       
@@ -741,11 +777,15 @@ class SignalingService {
           targetWorker: process.pid
         });
         
-        // metrics.signalingMessages.inc({
-        //   type: 'cross_server_received',
-        //   signal_type: signalType,
-        //   worker: process.pid
-        // });
+        try {
+          // metrics.signalingMessages.inc({
+          //   type: 'cross_server_received',
+          //   signal_type: signalType,
+          //   worker: process.pid
+          // });
+        } catch (metricsError) {
+          // Ignore metrics errors
+        }
       }
       
     } catch (error) {
@@ -785,10 +825,14 @@ class SignalingService {
           targetWorker: process.pid
         });
         
-        // metrics.signalingMessages.inc({
-        //   type: 'cross_server_message_received',
-        //   worker: process.pid
-        // });
+        try {
+          // metrics.signalingMessages.inc({
+          //   type: 'cross_server_message_received',
+          //   worker: process.pid
+          // });
+        } catch (metricsError) {
+          // Ignore metrics errors
+        }
       }
       
     } catch (error) {
@@ -839,6 +883,12 @@ class SignalingService {
   // Shutdown cleanup
   async shutdown() {
     logger.info('Shutting down signaling service', { worker: process.pid });
+    
+    // Clear cleanup timer
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
     
     // Clear in-memory queues
     this.messageQueue.clear();

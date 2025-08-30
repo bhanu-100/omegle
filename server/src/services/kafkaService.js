@@ -14,6 +14,8 @@ class KafkaService {
     this.reconnectTimer = null;
     this.batchTimer = null;
     this.isEnabled = !!process.env.KAFKA_BROKERS;
+    this.maxRetries = 3;
+    this.currentRetry = 0;
   }
 
   async init() {
@@ -29,11 +31,19 @@ class KafkaService {
         maxInFlightRequests: 1,
         idempotent: true,
         transactionTimeout: 30000,
-        allowAutoTopicCreation: false
+        allowAutoTopicCreation: false,
+        // OPTIMIZATION: Better retry configuration
+        retry: {
+          retries: 5,
+          factor: 2,
+          multiplier: 2,
+          maxRetryTime: 30000
+        }
       });
 
       await this.connectProducer();
       this.startBatchTimer();
+      this.currentRetry = 0; // Reset retry counter on successful connection
 
       logger.info('Kafka service initialized', {
         brokers: process.env.KAFKA_BROKERS,
@@ -64,15 +74,16 @@ class KafkaService {
       logLevel: 2 // WARN level
     };
 
-    // SSL configuration
+    // IMPROVED: SSL configuration with better error handling
     if (process.env.KAFKA_SSL_CA && process.env.KAFKA_SSL_KEY && process.env.KAFKA_SSL_CERT) {
       try {
         config.ssl = {
-          rejectUnauthorized: false,
+          rejectUnauthorized: process.env.KAFKA_SSL_REJECT_UNAUTHORIZED !== 'false',
           ca: [fs.readFileSync(process.env.KAFKA_SSL_CA, 'utf8')],
           key: fs.readFileSync(process.env.KAFKA_SSL_KEY, 'utf8'),
           cert: fs.readFileSync(process.env.KAFKA_SSL_CERT, 'utf8')
         };
+        logger.debug('SSL configuration loaded for Kafka');
       } catch (error) {
         logger.warn('Failed to load SSL certificates for Kafka', {
           error: error.message
@@ -87,6 +98,7 @@ class KafkaService {
         username: process.env.KAFKA_SASL_USERNAME,
         password: process.env.KAFKA_SASL_PASSWORD
       };
+      logger.debug('SASL authentication configured for Kafka');
     }
 
     return config;
@@ -113,25 +125,41 @@ class KafkaService {
         worker: process.pid
       });
       
-      // metrics.errorRate.inc({ type: 'kafka_connection', worker: process.pid });
+      try {
+        // metrics.errorRate.inc({ type: 'kafka_connection', worker: process.pid });
+      } catch (metricsError) {
+        // Ignore metrics errors
+      }
       this.scheduleReconnect();
       throw error;
     }
   }
 
+  // OPTIMIZATION: Improved reconnection with exponential backoff
   scheduleReconnect() {
-    if (this.reconnectTimer) {
+    if (this.reconnectTimer || this.currentRetry >= this.maxRetries) {
       return;
     }
 
-    this.reconnectTimer = setInterval(async () => {
+    const backoffDelay = Math.min(30000, 1000 * Math.pow(2, this.currentRetry));
+    this.currentRetry++;
+
+    this.reconnectTimer = setTimeout(async () => {
       try {
-        logger.info('Attempting to reconnect to Kafka...');
+        logger.info(`Attempting to reconnect to Kafka (attempt ${this.currentRetry}/${this.maxRetries})...`);
         await this.connectProducer();
       } catch (error) {
         logger.debug('Kafka reconnection failed, will retry');
+        this.reconnectTimer = null;
+        
+        if (this.currentRetry < this.maxRetries) {
+          this.scheduleReconnect();
+        } else {
+          logger.error('Max Kafka reconnection attempts reached, giving up');
+          this.currentRetry = 0; // Reset for future attempts
+        }
       }
-    }, 30000);
+    }, backoffDelay);
   }
 
   startBatchTimer() {
@@ -140,8 +168,15 @@ class KafkaService {
     }, this.batchTimeout);
   }
 
+  // OPTIMIZATION: Better event validation and batching
   logEvent(eventType, eventData) {
     if (!this.isEnabled) {
+      return;
+    }
+
+    // ADDED: Input validation
+    if (!eventType || typeof eventType !== 'string') {
+      logger.warn('Invalid event type provided to Kafka service', { eventType });
       return;
     }
 
@@ -152,12 +187,21 @@ class KafkaService {
       ...eventData
     };
 
+    // OPTIMIZATION: Prevent batch overflow
+    if (this.eventBatch.length >= this.batchSize * 2) {
+      logger.warn('Kafka event batch overflow, dropping oldest events', {
+        currentSize: this.eventBatch.length,
+        worker: process.pid
+      });
+      this.eventBatch.splice(0, this.batchSize); // Remove oldest events
+    }
+
     this.eventBatch.push({
       topic: process.env.KAFKA_TOPIC_EVENTS || 'webrtc-events',
       messages: [{
-        key: eventData.socketId || null,
+        key: eventData.socketId || `worker-${process.pid}`,
         value: JSON.stringify(event),
-        timestamp: event.timestamp
+        timestamp: event.timestamp.toString()
       }]
     });
 
@@ -166,6 +210,7 @@ class KafkaService {
     }
   }
 
+  // IMPROVED: Better error handling and retry logic for batch sending
   async flushBatch() {
     if (this.eventBatch.length === 0 || !this.isConnected) {
       return;
@@ -188,11 +233,21 @@ class KafkaService {
         worker: process.pid
       });
       
-      // metrics.errorRate.inc({ type: 'kafka_batch', worker: process.pid });
+      try {
+        // metrics.errorRate.inc({ type: 'kafka_batch', worker: process.pid });
+      } catch (metricsError) {
+        // Ignore metrics errors
+      }
 
-      // Re-add failed batch to the beginning (with limit to prevent memory leaks)
-      if (this.eventBatch.length < this.batchSize * 2) {
-        this.eventBatch.unshift(...batch);
+      // OPTIMIZATION: Smart retry logic - only re-add if not too many failures
+      if (this.eventBatch.length < this.batchSize && batch.length < this.batchSize) {
+        this.eventBatch.unshift(...batch.slice(0, this.batchSize)); // Limit re-queued events
+      }
+
+      // Mark as disconnected if send fails
+      if (error.type === 'NETWORK_ERROR' || error.type === 'CONNECTION_ERROR') {
+        this.isConnected = false;
+        this.scheduleReconnect();
       }
     }
   }
@@ -200,6 +255,7 @@ class KafkaService {
   // Specialized event logging methods
   logConnectionEvent(eventType, socketId, additionalData = {}) {
     this.logEvent(eventType, {
+      category: 'connection',
       socketId,
       ...additionalData
     });
@@ -207,6 +263,7 @@ class KafkaService {
 
   logMatchmakingEvent(eventType, socketId, peerId = null, roomId = null, additionalData = {}) {
     this.logEvent(eventType, {
+      category: 'matchmaking',
       socketId,
       peerId,
       roomId,
@@ -216,6 +273,7 @@ class KafkaService {
 
   logSignalingEvent(eventType, socketId, peerId, signalType, additionalData = {}) {
     this.logEvent(eventType, {
+      category: 'signaling',
       socketId,
       peerId,
       signalType,
@@ -225,12 +283,14 @@ class KafkaService {
 
   logErrorEvent(errorType, socketId = null, error, additionalData = {}) {
     this.logEvent('error', {
+      category: 'error',
       errorType,
       socketId,
       error: {
         message: error.message || error,
         stack: error.stack,
-        code: error.code
+        code: error.code,
+        name: error.name
       },
       ...additionalData
     });
@@ -238,9 +298,20 @@ class KafkaService {
 
   logPerformanceEvent(metricType, value, socketId = null, additionalData = {}) {
     this.logEvent('performance', {
+      category: 'performance',
       metricType,
       value,
       socketId,
+      ...additionalData
+    });
+  }
+
+  // ADDED: Method for logging messaging events
+  logMessagingEvent(eventType, fromSocketId, toSocketId, additionalData = {}) {
+    this.logEvent(eventType, {
+      category: 'messaging',
+      fromSocketId,
+      toSocketId,
       ...additionalData
     });
   }
@@ -254,10 +325,14 @@ class KafkaService {
     return {
       status: this.isConnected ? 'connected' : 'disconnected',
       batchSize: this.eventBatch.length,
-      isReconnecting: !!this.reconnectTimer
+      isReconnecting: !!this.reconnectTimer,
+      retryCount: this.currentRetry,
+      maxRetries: this.maxRetries,
+      worker: process.pid
     };
   }
 
+  // OPTIMIZATION: Graceful shutdown with proper cleanup
   async shutdown() {
     if (!this.isEnabled) {
       return;
@@ -273,17 +348,30 @@ class KafkaService {
       }
 
       if (this.reconnectTimer) {
-        clearInterval(this.reconnectTimer);
+        clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
       }
 
-      // Flush remaining events
+      // Flush remaining events with timeout
       if (this.eventBatch.length > 0) {
         logger.info('Flushing remaining Kafka events', {
           count: this.eventBatch.length,
           worker: process.pid
         });
-        await this.flushBatch();
+        
+        const flushPromise = this.flushBatch();
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Flush timeout')), 5000)
+        );
+        
+        try {
+          await Promise.race([flushPromise, timeoutPromise]);
+        } catch (timeoutError) {
+          logger.warn('Kafka flush timed out during shutdown', {
+            remainingEvents: this.eventBatch.length,
+            worker: process.pid
+          });
+        }
       }
 
       // Disconnect producer
@@ -313,6 +401,20 @@ class KafkaService {
 
   get enabled() {
     return this.isEnabled;
+  }
+
+  // ADDED: Get service statistics
+  getStats() {
+    return {
+      isConnected: this.isConnected,
+      isEnabled: this.isEnabled,
+      batchSize: this.eventBatch.length,
+      maxBatchSize: this.batchSize,
+      batchTimeout: this.batchTimeout,
+      isReconnecting: !!this.reconnectTimer,
+      retryCount: this.currentRetry,
+      worker: process.pid
+    };
   }
 }
 

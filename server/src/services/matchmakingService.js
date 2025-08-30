@@ -9,16 +9,15 @@ class MatchmakingService {
       PRIORITY: 'match_queue:priority',
       NORMAL: 'match_queue:normal',
       RETRY: 'match_queue:retry',
-      REGIONAL: 'match_queue:regional' // New regional queue
+      REGIONAL: 'match_queue:regional'
     };
     
-    this.matchTimeout = 30000; // 30 seconds
+    this.matchTimeout = 30000;
     this.maxRetries = 3;
-    this.recentMatches = new Map(); // Track recent matches to prevent immediate re-matching
-    this.pendingMatches = new Map(); // Track pending match operations
-    this.matchPreferences = new Map(); // User preferences cache
+    this.recentMatches = new Map();
+    this.pendingMatches = new Map();
+    this.matchPreferences = new Map();
     
-    // Redis keys for distributed state
     this.redisKeys = {
       activeMatches: 'active_matches',
       userSessions: 'user_sessions',
@@ -28,15 +27,12 @@ class MatchmakingService {
       regionalQueues: 'regional_queues'
     };
 
-    // Start cleanup timer
     this.startCleanupTimer();
-    
-    // Geographic regions for better matching
     this.regions = ['NA', 'EU', 'AS', 'SA', 'OC', 'AF'];
   }
 
   async findMatch(socket, io, preferences = {}) {
-    // const matchTimer = metrics.matchmakingDuration.startTimer();
+    let matchTimer = null;
     const socketId = socket.id;
     const lockKey = `match_lock:${socketId}`;
     
@@ -94,7 +90,7 @@ class MatchmakingService {
           kafkaService.logMatchmakingEvent('match_found', socketId, matchResult.peerId, roomId, {
             waitTime: 0,
             matchQuality: matchResult.quality,
-            region: preferences.region||'any',
+            region: preferences.region || 'any',
           });
         } else {
           // Match creation failed, add to queue
@@ -123,7 +119,7 @@ class MatchmakingService {
         logger.debug('User added to matchmaking queue', { 
           socketId, 
           queuePosition, 
-          region: preferences.region||'any',
+          region: preferences.region || 'any',
           worker: process.pid 
         });
       }
@@ -136,7 +132,6 @@ class MatchmakingService {
         worker: process.pid
       });
       
-      // metrics.errorRate.inc({ type: 'matchmaking', worker: process.pid });
       socket.emit('error', {
         type: 'matchmaking_error',
         message: 'Failed to find match, please try again'
@@ -147,18 +142,18 @@ class MatchmakingService {
       // Release lock and cleanup
       await redisService.releaseLock(lockKey);
       this.pendingMatches.delete(socketId);
-      matchTimer();
+      if (matchTimer) matchTimer();
     }
   }
 
   async findAvailablePeerAtomic(socketId, preferences) {
     const script = `
       local socketId = ARGV[1]
-      local region = ARGV[2]
+      local region = ARGV[2] or ""
       local minQuality = tonumber(ARGV[3]) or 0
       
       -- Try regional queue first if region specified
-      if region and region ~= "" then
+      if region ~= "" and region ~= "any" then
         local regionalQueue = "match_queue:regional:" .. region
         local peer = redis.call('LPOP', regionalQueue)
         if peer and peer ~= socketId then
@@ -184,11 +179,11 @@ class MatchmakingService {
     try {
       const result = await redisService.evalScript(script, 0, 
         socketId, 
-        preferences.region || 'any', 
+        preferences.region || '', 
         preferences.minConnectionQuality || 0
       );
 
-      if (result && result.length >= 2) {
+      if (result && Array.isArray(result) && result.length >= 2) {
         const [peerId, queueType] = result;
         
         // Verify peer is still valid and get their preferences
@@ -228,38 +223,49 @@ class MatchmakingService {
 
   async checkCompatibility(socketId1, socketId2) {
     try {
-      // Get user preferences and connection quality
-      const [prefs1, prefs2, quality1, quality2] = await Promise.all([
+      // Get user preferences and connection quality with better error handling
+      const [prefs1, prefs2, quality1, quality2] = await Promise.allSettled([
         redisService.getHash(`user_preferences:${socketId1}`),
         redisService.getHash(`user_preferences:${socketId2}`),
         redisService.getHash(`connection_quality:${socketId1}`),
         redisService.getHash(`connection_quality:${socketId2}`)
       ]);
 
+      // Handle failed promises gracefully
+      const userPrefs1 = prefs1.status === 'fulfilled' ? prefs1.value : {};
+      const userPrefs2 = prefs2.status === 'fulfilled' ? prefs2.value : {};
+      const userQuality1 = quality1.status === 'fulfilled' ? quality1.value : {};
+      const userQuality2 = quality2.status === 'fulfilled' ? quality2.value : {};
+
       let score = 100; // Start with perfect score
 
       // Check recent match history to prevent immediate re-matching
-      const recentMatches1 = await redisService.getSet(`recent_matches:${socketId1}`);
-      if (recentMatches1.includes(socketId2)) {
-        return { compatible: false, reason: 'recent_match' };
+      try {
+        const recentMatches1 = await redisService.getSet(`recent_matches:${socketId1}`);
+        if (recentMatches1.includes(socketId2)) {
+          return { compatible: false, reason: 'recent_match' };
+        }
+      } catch (error) {
+        logger.warn('Failed to check recent matches', { error: error.message });
       }
 
       // Regional matching bonus
-      if (prefs1.region && prefs2.region && prefs1.region === prefs2.region) {
+      if (userPrefs1.region && userPrefs2.region && userPrefs1.region === userPrefs2.region) {
         score += 20;
       }
 
       // Connection quality matching
-      const quality1Score = parseInt(quality1.overall) || 50;
-      const quality2Score = parseInt(quality2.overall) || 50;
+      const quality1Score = parseInt(userQuality1.overall) || 50;
+      const quality2Score = parseInt(userQuality2.overall) || 50;
       const qualityDiff = Math.abs(quality1Score - quality2Score);
-      score -= qualityDiff * 0.5; // Penalize large quality differences
+      score -= qualityDiff * 0.5;
 
       // Language preference matching
-      if (prefs1.language && prefs2.language) {
-        if (prefs1.language === prefs2.language) {
+      if (userPrefs1.language && userPrefs2.language) {
+        if (userPrefs1.language === userPrefs2.language) {
           score += 10;
-        } else if (prefs1.acceptedLanguages && prefs1.acceptedLanguages.includes(prefs2.language)) {
+        } else if (userPrefs1.acceptedLanguages && Array.isArray(userPrefs1.acceptedLanguages) && 
+                   userPrefs1.acceptedLanguages.includes(userPrefs2.language)) {
           score += 5;
         }
       }
@@ -290,7 +296,7 @@ class MatchmakingService {
     const queueData = {
       socketId,
       timestamp: Date.now(),
-      region: preferences.region||'any',
+      region: preferences.region || 'any',
       connectionQuality: preferences.connectionQuality || 50,
       retryCount: preferences.retryCount || 0
     };
@@ -302,7 +308,7 @@ class MatchmakingService {
       queueName = this.queues.PRIORITY;
     }
     // Regional queue if region specified
-    else if (preferences.region && this.regions.includes(preferences.region)) {
+    else if (preferences.region && preferences.region !== 'any' && this.regions.includes(preferences.region)) {
       queueName = `${this.queues.REGIONAL}:${preferences.region}`;
     }
     // Retry queue for users who had failed matches
@@ -310,16 +316,21 @@ class MatchmakingService {
       queueName = this.queues.RETRY;
     }
 
-    await redisService.addToQueue(queueName, JSON.stringify(queueData));
-    
-    // Update queue metrics
-    // metrics.queueSize.set(
-    //   { queue: queueName.split(':').pop(), worker: process.pid },
-    //   await redisService.getQueueLength(queueName)
-    // );
-
-    // Store queue position for user
-    await redisService.setWithExpiry(`queue_position:${socketId}`, queueName, 300);
+    try {
+      await redisService.addToQueue(queueName, JSON.stringify(queueData));
+      
+      // Store queue position for user
+      await redisService.set(`queue_position:${socketId}`, queueName, 300);
+      
+      logger.debug('User added to queue', { socketId, queueName, worker: process.pid });
+    } catch (error) {
+      logger.error('Failed to add user to queue', {
+        error: error.message,
+        socketId,
+        queueName
+      });
+      throw error;
+    }
   }
 
   async removeFromAllQueues(socketId) {
@@ -338,8 +349,8 @@ class MatchmakingService {
         local queueItems = redis.call('LRANGE', queueName, 0, -1)
         
         for j, item in ipairs(queueItems) do
-          local data = cjson.decode(item)
-          if data.socketId == socketId then
+          local success, data = pcall(cjson.decode, item)
+          if success and data.socketId == socketId then
             redis.call('LREM', queueName, 1, item)
             removed = removed + 1
           end
@@ -409,10 +420,10 @@ class MatchmakingService {
         return false;
       }
 
-      // Verify both users are still available
+      // FIXED: Verify both users are still available - corrected duplicate socketId bug
       const [userSession, peerSession] = await Promise.all([
         redisService.exists(`user_session:${socketId}`),
-        redisService.exists(`user_session:${socketId}`)
+        redisService.exists(`user_session:${peerId}`) // Fixed: was socketId instead of peerId
       ]);
 
       if (!userSession || !peerSession) {
@@ -444,74 +455,71 @@ class MatchmakingService {
         return false;
       }
 
-      // Get socket IDs from multiple possible servers
-      const [userSocketId, peerSocketId] = await Promise.all([
-        redisService.getSocketId(socketId),
-        redisService.getSocketId(peerId)
-      ]);
-
-      if (!userSocketId || !peerSocketId) {
-        logger.warn('Socket IDs not found during match creation', {
-          socketId, peerId, userSocketId, peerSocketId, worker: process.pid
-        });
+      // IMPROVED: Better socket handling for cross-server scenarios
+      try {
+        // Join both sockets to the room
+        await socket.join(roomId);
         
-        // Clean up the match
-        await redisService.deleteMatch(socketId);
-        await redisService.deleteMatch(peerId);
+        // Find peer socket and join to room
+        const peerSocket = await this.findSocketById(io, peerId);
+        if (peerSocket) {
+          await peerSocket.join(roomId);
+        }
+
+        // Notify both users
+        const baseMatchData = {
+          roomId,
+          timestamp: Date.now(),
+          matchType: 'webrtc_chat',
+          matchQuality: matchData.matchQuality
+        };
+
+        socket.emit('match_found', { ...baseMatchData, peerId });
+        
+        if (peerSocket) {
+          peerSocket.emit('match_found', { ...baseMatchData, peerId: socketId });
+        } else {
+          // Handle cross-server notification via Redis pub/sub
+          await this.notifyPeerCrossServer(peerId, { ...baseMatchData, peerId: socketId });
+        }
+
+        // Update recent matches to prevent immediate re-matching
+        await Promise.all([
+          redisService.addToSet(`recent_matches:${socketId}`, peerId, 300),
+          redisService.addToSet(`recent_matches:${peerId}`, socketId, 300)
+        ]);
+
+        // Update user stats
+        await Promise.all([
+          redisService.updateUserStats(socketId, {
+            totalMatches: 1,
+            lastMatch: Date.now(),
+            lastPeer: peerId
+          }),
+          redisService.updateUserStats(peerId, {
+            totalMatches: 1,
+            lastMatch: Date.now(),
+            lastPeer: socketId
+          })
+        ]);
+
+        logger.info('Match created successfully', {
+          socketId, peerId, roomId, matchQuality: matchData.matchQuality, worker: process.pid
+        });
+
+        return true;
+      } catch (notificationError) {
+        logger.error('Error in match notification', {
+          error: notificationError.message,
+          socketId, peerId, roomId
+        });
+        // Clean up the match if notification failed
+        await Promise.all([
+          redisService.deleteMatch(socketId),
+          redisService.deleteMatch(peerId)
+        ]);
         return false;
       }
-
-      // Join both sockets to the room (works across server instances)
-      await Promise.all([
-        io.socketsJoin(roomId),
-        this.joinSocketToRoom(io, userSocketId, roomId),
-        this.joinSocketToRoom(io, peerSocketId, roomId)
-      ]);
-
-      // Notify both users
-      const baseMatchData = {
-        roomId,
-        timestamp: Date.now(),
-        matchType: 'webrtc_chat',
-        matchQuality: matchData.matchQuality
-      };
-
-      const userMatchData = { ...baseMatchData, peerId };
-      const peerMatchData = { ...baseMatchData, peerId: socketId };
-
-      // Emit to specific sockets
-      io.to(userSocketId).emit('match_found', userMatchData);
-      io.to(peerSocketId).emit('match_found', peerMatchData);
-
-      // Update recent matches to prevent immediate re-matching
-      await Promise.all([
-        redisService.addToSet(`recent_matches:${socketId}`, peerId, 300), // 5 minutes
-        redisService.addToSet(`recent_matches:${peerId}`, socketId, 300)
-      ]);
-
-      // Update metrics
-      // metrics.activeMatches.inc({ worker: process.pid });
-      // metrics.matchmakingSuccess.inc({ worker: process.pid });
-
-      // Update user stats
-      await Promise.all([
-        redisService.updateUserStats(socketId, {
-          totalMatches: 1,
-          lastMatch: Date.now(),
-          lastPeer: peerId
-        }),
-        redisService.updateUserStats(peerId, {
-          totalMatches: 1,
-          lastMatch: Date.now(),
-          lastPeer: socketId
-        })
-      ]);
-
-      logger.info('Match created successfully', {
-        socketId, peerId, roomId, matchQuality: matchData.matchQuality, worker: process.pid
-      });
-
-      return true;
 
     } catch (error) {
       logger.error('Error in atomic match creation', {
@@ -520,29 +528,34 @@ class MatchmakingService {
         socketId, peerId, roomId,
         worker: process.pid
       });
-      
-      // metrics.errorRate.inc({ type: 'match_creation', worker: process.pid });
       return false;
     } finally {
       await redisService.releaseLock(matchLock);
     }
   }
 
-  async joinSocketToRoom(io, socketId, roomId) {
+  // OPTIMIZATION: More efficient socket finding
+  async findSocketById(io, socketId) {
     try {
-      const sockets = await io.fetchSockets();
-      const targetSocket = sockets.find(s => s.id === socketId);
-      if (targetSocket) {
-        await targetSocket.join(roomId);
-        return true;
-      }
-      return false;
+      const socket = io.sockets.sockets.get(socketId);
+      return socket && socket.connected ? socket : null;
     } catch (error) {
-      logger.warn('Failed to join socket to room', {
+      logger.warn('Error finding socket by ID', { error: error.message, socketId });
+      return null;
+    }
+  }
+
+  // OPTIMIZATION: Cross-server peer notification
+  async notifyPeerCrossServer(peerId, matchData) {
+    try {
+      const { pubClient } = redisService.getClients();
+      const channel = `match_notification:${peerId}`;
+      await pubClient.publish(channel, JSON.stringify(matchData));
+    } catch (error) {
+      logger.error('Failed to send cross-server match notification', {
         error: error.message,
-        socketId, roomId
+        peerId
       });
-      return false;
     }
   }
 
@@ -583,8 +596,13 @@ class MatchmakingService {
   }
 
   async wasRecentlyMatched(socketId) {
-    const recentMatches = await redisService.getSet(`recent_matches:${socketId}`);
-    return recentMatches.length > 0;
+    try {
+      const recentMatches = await redisService.getSet(`recent_matches:${socketId}`);
+      return recentMatches.length > 0;
+    } catch (error) {
+      logger.warn('Error checking recent matches', { error: error.message, socketId });
+      return false;
+    }
   }
 
   calculateEstimatedWait(queuePosition) {
@@ -675,8 +693,6 @@ class MatchmakingService {
 
           // Update metrics
           const matchDuration = Date.now() - matchData.createdAt;
-          // metrics.activeMatches.dec({ worker: process.pid });
-          // metrics.matchDuration.observe(matchDuration / 1000);
           
           kafkaService.logMatchmakingEvent('match_ended', socketId, peerId, matchData.roomId, {
             duration: matchDuration,
@@ -686,7 +702,7 @@ class MatchmakingService {
       }
 
       // Cleanup user data
-      await Promise.all([
+      await Promise.allSettled([
         redisService.deleteKey(`user_preferences:${socketId}`),
         redisService.deleteKey(`connection_quality:${socketId}`),
         redisService.deleteKey(`recent_matches:${socketId}`),
@@ -703,8 +719,6 @@ class MatchmakingService {
         socketId,
         worker: process.pid
       });
-      
-      // metrics.errorRate.inc({ type: 'disconnect_handling', worker: process.pid });
     }
   }
 
@@ -743,7 +757,7 @@ class MatchmakingService {
   // Enhanced cleanup of stale data
   startCleanupTimer() {
     setInterval(async () => {
-      await Promise.all([
+      await Promise.allSettled([
         this.cleanupStaleMatches(),
         this.cleanupStaleQueues(),
         this.cleanupStaleUserData()
@@ -827,7 +841,7 @@ class MatchmakingService {
         if (sessionData.connectedAt && Date.now() - parseInt(sessionData.connectedAt) > staleThreshold) {
           const socketId = key.replace('user_session:', '');
           
-          await Promise.all([
+          await Promise.allSettled([
             redisService.deleteKey(key),
             redisService.deleteKey(`user_preferences:${socketId}`),
             redisService.deleteKey(`connection_quality:${socketId}`),
