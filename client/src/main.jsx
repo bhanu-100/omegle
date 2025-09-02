@@ -77,9 +77,7 @@ if (import.meta.env.VITE_ENABLE_STATS === 'true') {
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
     <ErrorBoundary>
       <App />
     </ErrorBoundary>
-  </React.StrictMode>,
 )

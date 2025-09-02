@@ -22,27 +22,6 @@ const getBackendUrl = () => {
     return import.meta.env.VITE_API_URL;
   }
   
-  // Fallback environment variable
-  if (import.meta.env.VITE_SERVER_URL) {
-    return import.meta.env.VITE_SERVER_URL;
-  }
-  
-  // Auto-detection for development
-  if (typeof window !== 'undefined') {
-    const { protocol, hostname } = window.location;
-    
-    // Production environment detection
-    if (hostname.includes('.vercel.app') || 
-        hostname.includes('.netlify.app') ||
-        hostname.includes('.herokuapp.com')) {
-      return `${protocol}//${hostname}`;
-    }
-    
-    // Development fallback
-    const port = import.meta.env.VITE_DEV_SERVER_PORT || '3000';
-    return `${protocol}//${hostname}:${port}`;
-  }
-  
   // Server-side rendering fallback
   return 'http://localhost:3000';
 };
