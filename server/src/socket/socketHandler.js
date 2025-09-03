@@ -463,44 +463,57 @@ class SocketHandler {
     });
 
     // Enhanced messaging with content filtering
-    socket.on('message', async (data) => {
-      try {
-        if (await this.isRateLimited(socketId, 'messaging')) {
-          socket.emit('rate_limited', { 
-            type: 'messaging',
-            message: 'Too many messages. Please slow down.'
-          });
-          return;
-        }
+    socket.on('message', async (data, callback) => {
 
-        this.updateActivity(socketId);
-        
-        if (!this.validateMessage(data)) {
-          socket.emit('error', {
-            type: 'invalid_message',
-            message: 'Invalid message format'
-          });
-          return;
-        }
+  try {
+    if (await this.isRateLimited(socketId, 'messaging')) {
+      socket.emit('rate_limited', { 
+        type: 'messaging',
+        message: 'Too many messages. Please slow down.'
+      });
+      return callback?.({ error: 'rate_limited' });
+    }
 
-        // Content filtering (implement your content filter here)
-        const sanitizedMessage = this.sanitizeMessage(data);
-        
-        await signalingService.forwardMessage(socket, socketId, sanitizedMessage);
-        
-      } catch (error) {
-        logger.error('Message forwarding error', {
-          error: error.message,
-          socketId,
-          worker: process.pid
-        });
-        
-        socket.emit('error', {
-          type: 'message_error',
-          message: 'Failed to send message'
-        });
-      }
+    this.updateActivity(socketId);
+
+    if (!this.validateMessage(data)) {
+      socket.emit('error', {
+        type: 'invalid_message',
+        message: 'Invalid message format'
+      });
+      return callback?.({ error: 'invalid_message' });
+    }
+
+    // Sanitize
+    const sanitizedMessage = this.sanitizeMessage(data);
+
+    // Forward to peer
+    const ack = await signalingService.forwardMessage(socket, socketId, sanitizedMessage);
+    if(ack){
+      callback?.({ success: true });
+    }else{
+      callback?.({ success: false });
+    }
+
+    // ✅ respond to client to resolve Promise
+    
+
+  } catch (error) {
+    logger.error('Message forwarding error', {
+      error: error.message,
+      socketId,
+      worker: process.pid
     });
+
+    socket.emit('error', {
+      type: 'message_error',
+      message: 'Failed to send message'
+    });
+
+    callback?.({ error: 'message_error' });
+  }
+});
+
 
     // Connection quality monitoring
     socket.on('connection_quality', async (data) => {

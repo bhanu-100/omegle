@@ -220,7 +220,6 @@ export default function App() {
   // Message sending
   const sendMessage = useCallback(async () => {
     if (!inputMessage.trim() || connectionState !== CONNECTION_STATES.CONNECTED) return;
-    
     const sanitized = messageUtils.sanitizeMessage(inputMessage);
     if (!messageUtils.isValidMessage(sanitized)) {
       setError('Invalid message. Please check your input.');
@@ -228,7 +227,11 @@ export default function App() {
     }
     
     try {
-      await socketService.emit('message', sanitized);
+      const ack = await socketService.emit('message', sanitized);
+      
+    if (!ack || ack.error) {
+      throw new Error(ack?.error || 'user may be offline,try again');
+    }
       addMessage(MESSAGE_TYPES.USER, sanitized);
       setInputMessage('');
     } catch (error) {
@@ -318,6 +321,12 @@ const setupSocketHandlers = useCallback(() => {
 
     on('message', (data) => {
       if (data) addMessage(MESSAGE_TYPES.STRANGER, data);
+    }),
+
+    on('message_error', (error) => {
+      dev.error('message Error:', error.error);
+      setConnectionState(CONNECTION_STATES.ERROR);
+      handleError(error, error.message);
     }),
 
     on('waiting', () => {

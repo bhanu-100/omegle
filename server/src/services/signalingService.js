@@ -291,7 +291,6 @@ class SignalingService {
         });
         return false;
       }
-
       // Prepare message
       const message = {
         type: 'message',
@@ -313,7 +312,6 @@ class SignalingService {
           roomId: matchData.roomId,
           latency: Date.now() - startTime
         });
-        
         return true;
       } else {
         // Queue for offline delivery
@@ -332,7 +330,6 @@ class SignalingService {
         error: 'forwarding_failed',
         message: 'Failed to send message'
       });
-      
       return false;
     }
   }
@@ -349,25 +346,21 @@ class SignalingService {
 
       const targetSocketId = sessionData.socketId;
       const targetWorker = sessionData.worker;
-      
+
       // Local delivery
       if (targetWorker && parseInt(targetWorker) === process.pid) {
-        const io = require('./socketHandler').getIO();
+        const io = require('../socket/socketHandler').getIO();
         const socket = io.sockets.sockets.get(targetSocketId);
-        
         if (socket && socket.connected) {
           socket.emit('message', message.data);
-          
           logger.debug('Message delivered locally', {
             socketId: targetSocketId,
             messageId: message.messageId,
             worker: process.pid
           });
-          
           return true;
         }
       }
-      
       // Cross-server delivery
       const { pubClient } = redisService.getClients();
       const channelName = `messaging:${toUserKey}`;
