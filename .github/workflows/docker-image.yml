@@ -1,13 +1,13 @@
-name: Docker Images CI
+name: Docker Compose CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,26 +26,10 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 4. Build and push all Docker images
-      - name: Build & Push Docker Images
-        run: |
-          declare -A IMAGES
-          # ImageName: DockerfilePath
-          IMAGES=(
-            ["bhanux100/server-webrtc-chat"]="omegle/server/Dockerfile"
-            ["bhanux100/nginx"]="nginx/Dockerfile"
-            ["bhanux100/grafana"]="grafana/Dockerfile"
-            ["bhanux100/prometheus"]="prometheus/Dockerfile"
-            ["bhanux100/redisinsight"]="redisinsight/Dockerfile"
-            ["bhanux100/redis"]="redis/Dockerfile"
-            ["bhanux100/cp-kafka"]="kafka/Dockerfile"
-            ["bhanux100/cp-zookeeper"]="zookeeper/Dockerfile"
-          )
+      # 4. Build all Docker images using docker-compose
+      - name: Build Docker images
+        run: docker-compose -f omegle/server/docker-compose.yml build
 
-          for IMAGE in "${!IMAGES[@]}"; do
-            DOCKERFILE_PATH=${IMAGES[$IMAGE]}
-            echo "Building $IMAGE from $DOCKERFILE_PATH"
-            docker build -f $DOCKERFILE_PATH -t $IMAGE:latest .
-            echo "Pushing $IMAGE:latest"
-            docker push $IMAGE:latest
-          done
+      # 5. Push all Docker images
+      - name: Push Docker images
+        run: docker-compose -f omegle/server/docker-compose.yml push
