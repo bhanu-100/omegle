@@ -91,101 +91,7 @@ export default function App() {
     }
   }, [micEnabled, cameraEnabled, handleError]);
 
-  // WebRTC event handlers
-  const setupWebRTCHandlers = useCallback(() => {
-    webrtcService.on('remote_stream', ({ stream }) => {
-      dev.log('Remote stream received');
-      setStatusMessage('Video connected!');
-    });
-
-    webrtcService.on('connection_state_change', ({ newState }) => {
-      dev.log('WebRTC connection state:', newState);
-      
-      if (newState === 'connected') {
-        setStatusMessage('WebRTC Connected!');
-      } else if (newState === 'failed' || newState === 'disconnected') {
-        setStatusMessage('Connection lost. Trying to reconnect...');
-      }
-    });
-
-    webrtcService.on('stats_updated', (stats) => {
-      setPerformanceStats(prev => ({
-        ...prev,
-        packetsLost: stats.packetsLost,
-        packetsReceived: stats.packetsReceived,
-        bandwidth: stats.bandwidth,
-        quality: stats.quality
-      }));
-    });
-
-    webrtcService.on('media_error', (error) => {
-      handleError(error, 'webrtc_media_error');
-    });
-
-    webrtcService.on('ice_candidate', ({ candidate }) => {
-      socketService.emit('webrtc_ice_candidate', { candidate });
-    });
-
-  }, [handleError]);
-// Socket event handlers
-const setupSocketHandlers = useCallback(() => {
-  socketService.on('match_cancelled', handlePeerDisconnected);
-
-  // Correct usage: provide callback function
-  socketService.on('pong', (data) => {
-    dev.log('Pong received:', data);
-    // You can optionally respond with pong
-    socketService.emit('ping', { timestamp: Date.now() });
-  });
-
-  socketService.on('match_timeout', (data) => {
-    dev.log('Match timeout:', data);
-    setStatusMessage(data?.message || 'No match found, please try again');
-    handlePeerDisconnected();
-  });
-
-  socketService.on('match_found',(data) => {
-    dev.log('Match found:', data);
-    handleMatchFound(data);
-  });
-  socketService.on('webrtc_offer', handleWebRTCOffer);
-  socketService.on('webrtc_answer', handleWebRTCAnswer);
-  socketService.on('webrtc_ice_candidate', handleICECandidate);
-  socketService.on('peer_disconnected', handlePeerDisconnected);
-  socketService.on('rate_limited', handleRateLimited);
-
-  socketService.on('message', (data) => addMessage(MESSAGE_TYPES.STRANGER, data));
-
-  socketService.on('waiting', () => {
-    setConnectionState(CONNECTION_STATES.WAITING);
-    setStatusMessage('Waiting for partner...');
-  });
-
-  socketService.on('connect', () => {
-    dev.log('Socket connected');
-    setIsReconnecting(false);
-    setConnectionState(CONNECTION_STATES.WAITING);
-    setStatusMessage('Looking for a chat partner...');
-    setError(null);
-    socketService.emit('find_match');
-  });
-
-  socketService.on('disconnect', ({ reason }) => {
-    dev.log('Socket disconnected:', reason);
-    setConnectionState(CONNECTION_STATES.DISCONNECTED);
-    setStatusMessage('Connection lost. Reconnecting...');
-    setIsReconnecting(true);
-  });
-
-  socketService.on('error', (error) => {
-    dev.error('Socket connection error:', error);
-    setConnectionState(CONNECTION_STATES.ERROR);
-    handleError(error, 'socket_connect_error');
-  });
-}, [handleError, addMessage]);
-
-// Other callbacks remain the same
-
+ 
 
   // WebRTC signaling handlers
   const handleMatchFound = useCallback(async ({peerId}) => {
@@ -340,6 +246,116 @@ const setupSocketHandlers = useCallback(() => {
     socketService.emit('skip');
     socketService.emit('find_match');
   }, []);
+
+   // WebRTC event handlers
+  const setupWebRTCHandlers = useCallback(() => {
+    webrtcService.on('remote_stream', ({ stream }) => {
+      dev.log('Remote stream received');
+      setStatusMessage('Video connected!');
+    });
+
+    webrtcService.on('connection_state_change', ({ newState }) => {
+      dev.log('WebRTC connection state:', newState);
+      
+      if (newState === 'connected') {
+        setStatusMessage('WebRTC Connected!');
+      } else if (newState === 'failed' || newState === 'disconnected') {
+        setStatusMessage('Connection lost. Trying to reconnect...');
+      }
+    });
+
+    webrtcService.on('stats_updated', (stats) => {
+      setPerformanceStats(prev => ({
+        ...prev,
+        packetsLost: stats.packetsLost,
+        packetsReceived: stats.packetsReceived,
+        bandwidth: stats.bandwidth,
+        quality: stats.quality
+      }));
+    });
+
+    webrtcService.on('media_error', (error) => {
+      handleError(error, 'webrtc_media_error');
+    });
+
+    webrtcService.on('ice_candidate', ({ candidate }) => {
+      socketService.emit('webrtc_ice_candidate', { candidate });
+    });
+
+  }, [handleError]);
+// Socket event handlers
+const setupSocketHandlers = useCallback(() => {
+  // --- Helper for safe subscription ---
+  const on = (event, handler) => {
+    socketService.on(event, handler);
+    return () => socketService.off(event, handler);
+  };
+
+  const cleanups = [
+    on('match_cancelled', handlePeerDisconnected),
+
+    on('pong', (data) => {
+      dev.log('Pong received:', data);
+      socketService.emit('ping', { timestamp: Date.now() }); // optional keep-alive
+    }),
+
+    on('match_timeout', (data) => {
+      dev.log('Match timeout:', data);
+      setStatusMessage(data?.message || 'No match found, please try again');
+      handlePeerDisconnected();
+    }),
+
+    on('match_found', (data) => {
+      dev.log('Match found:', data);
+      handleMatchFound(data);
+    }),
+
+    on('webrtc_offer', handleWebRTCOffer),
+    on('webrtc_answer', handleWebRTCAnswer),
+    on('webrtc_ice_candidate', handleICECandidate),
+    on('peer_disconnected', handlePeerDisconnected),
+    on('rate_limited', handleRateLimited),
+
+    on('message', (data) => {
+      if (data) addMessage(MESSAGE_TYPES.STRANGER, data);
+    }),
+
+    on('waiting', () => {
+      setConnectionState(CONNECTION_STATES.WAITING);
+      setStatusMessage('Waiting for partner...');
+    }),
+
+    on('connect', () => {
+      dev.log('Socket connected');
+      setIsReconnecting(false);
+      setConnectionState(CONNECTION_STATES.WAITING);
+      setStatusMessage('Looking for a chat partner...');
+      setError(null);
+      socketService.emit('find_match');
+    }),
+
+    on('disconnect', ({ reason }) => {
+      dev.log('Socket disconnected:', reason);
+      setConnectionState(CONNECTION_STATES.DISCONNECTED);
+      setStatusMessage('Connection lost. Reconnecting...');
+      setIsReconnecting(true);
+    }),
+
+    on('error', (error) => {
+      dev.error('Socket connection error:', error);
+      setConnectionState(CONNECTION_STATES.ERROR);
+      handleError(error, 'socket_connect_error');
+    }),
+  ];
+
+  // --- Cleanup function ---
+  return () => {
+    cleanups.forEach((cleanup) => cleanup());
+  };
+}, [handleError, addMessage, handlePeerDisconnected, handleMatchFound, handleWebRTCOffer, handleWebRTCAnswer, handleICECandidate, handleRateLimited]);
+
+// Other callbacks remain the same
+
 
   // Initialize application
   useEffect(() => {

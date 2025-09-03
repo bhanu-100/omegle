@@ -203,7 +203,7 @@ class SocketHandler {
       const socketId = socket.id;
       
       // Rate limiting check with IP-based tracking
-      if (await this.isConnectionRateLimited(clientIP)) {
+      if (await this.isConnectionRateLimited(socketId)) {
         logger.warn('Connection rate limit exceeded', { 
           clientIP, 
           socketId,
@@ -297,8 +297,8 @@ class SocketHandler {
            'unknown';
   }
 
-  async isConnectionRateLimited(clientIP) {
-    const key = `rate_limit:connection:${clientIP}`;
+  async isConnectionRateLimited(socketId) {
+    const key = `rate_limit:connection:${socketId}`;
     const current = await redisService.incr(key);
     
     if (current === 1) {
