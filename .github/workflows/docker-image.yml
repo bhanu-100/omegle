@@ -28,10 +28,13 @@ jobs:
 
      # 4. Build all Docker images using docker-compose
       - name: Build Docker images
-        run: docker-compose -f docker-compose.prod.yml build --pull --no-cache
+        run: |
+          IMAGE_TAG=my-image-name:$(date +%s)
+          docker build -f ./Dockerfile -t $IMAGE_TAG .
         env:
           COMPOSE_DOCKER_CLI_BUILD: 1
           DOCKER_BUILDKIT: 1
+        shell: /usr/bin/bash -e {0}
       # 5. Push all Docker images using docker-compose
       - name: Push Docker images
         run: docker-compose -f docker-compose.prod.yml push
