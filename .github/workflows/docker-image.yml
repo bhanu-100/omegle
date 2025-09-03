@@ -1,4 +1,4 @@
-name: Docker Compose CI
+name: Docker Compose CI/CD
 
 on:
   push:
@@ -11,12 +11,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout repo
+      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Set up Docker Buildx
-      - name: Set up Docker Buildx
+      # 2. Set up Docker
+      - name: Set up Docker
         uses: docker/setup-buildx-action@v3
 
       # 3. Log in to Docker Hub
@@ -26,17 +26,17 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-     # 4. Build all Docker images using docker-compose
-      - name: Build Docker image
-        id: build_and_tag
+      # 4. Build Docker images using docker-compose
+      - name: Build Docker images
         run: |
           IMAGE_TAG=my-image-name:$(date +%s)
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          docker-compose build -f ./server/Dockerfile -t $IMAGE_TAG .
-          
-      - name: Push Docker image
-        run: docker-compose push ${{ env.IMAGE_TAG }}
+          docker compose -f ./server/docker-compose.yml build
 
-      # 5. Optionally, you can add steps to deploy the images if needed
-      - name: Deploy (if needed)
+      # 5. Push Docker images
+      - name: Push Docker images
+        run: docker compose -f ./server/docker-compose.yml push
+
+      # 6. Deploy (optional)
+      - name: Deploy
         run: echo "Deploy step can be added here"
