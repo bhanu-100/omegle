@@ -144,7 +144,10 @@ const setupSocketHandlers = useCallback(() => {
     handlePeerDisconnected();
   });
 
-  socketService.on('match_found', handleMatchFound);
+  socketService.on('match_found',(data) => {
+    dev.log('Match found:', data);
+    handleMatchFound(data);
+  });
   socketService.on('webrtc_offer', handleWebRTCOffer);
   socketService.on('webrtc_answer', handleWebRTCAnswer);
   socketService.on('webrtc_ice_candidate', handleICECandidate);
@@ -185,7 +188,7 @@ const setupSocketHandlers = useCallback(() => {
 
 
   // WebRTC signaling handlers
-  const handleMatchFound = useCallback(async ({ roomId, peerInfo }) => {
+  const handleMatchFound = useCallback(async ({peerId}) => {
     try {
       performanceMonitor.start('match-setup');
       
@@ -202,7 +205,7 @@ const setupSocketHandlers = useCallback(() => {
       
       performanceMonitor.end('match-setup');
       addMessage(MESSAGE_TYPES.SYSTEM, 'Connected to partner! Say hello!');
-      
+      console.log('Matched with peer:', peerId, baseMatchData);
       // Show notification if permitted
       if (document.hidden) {
         notifications.show('WebRTC Chat', {

@@ -13,6 +13,7 @@ class SocketClient {
     this.reconnectAttempt = 0;
     this.listeners = new Map();
     this.emitQueue = [];
+    this.pendingListeners = new Map(); // Store listeners that need to be attached when socket is ready
     this.stats = {
       connectTime: null,
       reconnects: 0,
@@ -51,6 +52,7 @@ class SocketClient {
       });
 
       this.setupEventHandlers();
+      this.attachPendingListeners(); // Attach any listeners that were added before socket was ready
       performanceMonitor.end('socket-init');
       
       return this.socket;
@@ -64,6 +66,29 @@ class SocketClient {
     }
   }
 
+  // NEW METHOD: Attach pending listeners when socket is ready
+  attachPendingListeners() {
+    if (!this.socket || this.pendingListeners.size === 0) return;
+    
+    dev.log('Attaching pending listeners:', Array.from(this.pendingListeners.keys()));
+    
+    for (const [event, callbacks] of this.pendingListeners) {
+      for (const callback of callbacks) {
+        if (!this.isInternalEvent(event)) {
+          this.socket.on(event, callback);
+          dev.log(`Attached pending listener for event: ${event}`);
+        }
+      }
+    }
+    
+    this.pendingListeners.clear();
+  }
+
+  // NEW METHOD: Check if event is internal
+  isInternalEvent(event) {
+    return ['connect', 'disconnect', 'connect_error', 'reconnect_attempt', 'reconnect_failed', 'error', 'transport_upgrade', 'transport_upgrade_error'].includes(event);
+  }
+
   setupEventHandlers() {
     if (!this.socket) return;
 
@@ -74,7 +99,7 @@ class SocketClient {
     this.socket.on('reconnect_attempt', this.handleReconnectAttempt.bind(this));
     this.socket.on('reconnect_failed', this.handleReconnectFailed.bind(this));
     this.socket.on('error', this.handleError.bind(this));
-
+    
     // Transport events
     this.socket.io.on('upgrade', this.handleUpgrade.bind(this));
     this.socket.io.on('upgradeError', this.handleUpgradeError.bind(this));
@@ -99,6 +124,10 @@ class SocketClient {
     
     this.reconnectAttempt = 0;
     this.flushEmitQueue();
+    
+    // Reattach any pending listeners after reconnection
+    this.attachPendingListeners();
+    
     // Publish internal event
     this.eventEmitter.dispatchEvent(new CustomEvent('connect', { detail: { socketId: this.socket.id, transport } }));
   }
@@ -208,20 +237,17 @@ class SocketClient {
     }
 
     return new Promise((resolve, reject) => {
-      // Add listeners first to avoid race conditions
       const onConnect = () => {
-        // We handle connection state in handleConnect, so just resolve the promise
         resolve();
-        // The listeners will be removed by the .off() calls in the finally block
       };
       
       const onError = (error) => {
-        // The error is already handled by handleConnectError, just reject the promise
         reject(error);
       };
       
-      this.on('connect', onConnect);
-      this.on('connect_error', onError);
+      // Use once to avoid memory leaks
+      this.once('connect', onConnect);
+      this.once('connect_error', onError);
 
       const timeout = setTimeout(() => {
         this.off('connect', onConnect);
@@ -232,11 +258,14 @@ class SocketClient {
       this.connecting = true;
       dev.log('Initiating connection...');
       this.socket.connect();
-    }).finally(() => {
-      // Clean up listeners from the promise after it resolves or rejects
-      // The `on` and `off` methods handle the EventTarget as well as the socket listeners
-      this.off('connect', this.handleConnect.bind(this));
-      this.off('connect_error', this.handleConnectError.bind(this));
+      
+      // Clear timeout when promise resolves
+      Promise.race([
+        new Promise(res => this.once('connect', res)),
+        new Promise((_, rej) => this.once('connect_error', rej))
+      ]).finally(() => {
+        clearTimeout(timeout);
+      });
     });
   }
 
@@ -264,6 +293,7 @@ class SocketClient {
     
     this.clearEmitQueue();
     this.listeners.clear();
+    this.pendingListeners.clear(); // Clear pending listeners
     this.connected = false;
     this.connecting = false;
   }
@@ -367,6 +397,7 @@ class SocketClient {
     return false;
   }
 
+  // FIXED: Improved event listener handling
   on(event, callback) {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set());
@@ -374,23 +405,37 @@ class SocketClient {
     this.listeners.get(event).add(callback);
     
     // For internal events, use EventTarget
-    if (['connect', 'disconnect', 'connect_error', 'reconnect_attempt', 'reconnect_failed', 'error', 'transport_upgrade', 'transport_upgrade_error'].includes(event)) {
+    if (this.isInternalEvent(event)) {
       this.eventEmitter.addEventListener(event, callback);
     } else if (this.socket) {
-      // For all other custom events, use the socket
+      // If socket exists, attach immediately
       this.socket.on(event, callback);
+      dev.log(`Attached listener for event: ${event}`);
+    } else {
+      // If socket doesn't exist yet, store for later
+      if (!this.pendingListeners.has(event)) {
+        this.pendingListeners.set(event, new Set());
+      }
+      this.pendingListeners.get(event).add(callback);
+      dev.log(`Stored pending listener for event: ${event}`);
     }
   }
 
+  // FIXED: Improved event listener removal
   off(event, callback) {
     if (this.listeners.has(event)) {
       this.listeners.get(event).delete(callback);
     }
     
-    if (['connect', 'disconnect', 'connect_error', 'reconnect_attempt', 'reconnect_failed', 'error', 'transport_upgrade', 'transport_upgrade_error'].includes(event)) {
+    if (this.isInternalEvent(event)) {
       this.eventEmitter.removeEventListener(event, callback);
     } else if (this.socket) {
       this.socket.off(event, callback);
+    }
+    
+    // Also remove from pending listeners
+    if (this.pendingListeners.has(event)) {
+      this.pendingListeners.get(event).delete(callback);
     }
   }
 
@@ -409,6 +454,7 @@ class SocketClient {
       socketId: this.socket?.id,
       transport: this.socket?.io?.engine?.transport?.name,
       queueSize: this.emitQueue.length,
+      pendingListeners: this.pendingListeners.size,
       backendUrl: CONFIG.BACKEND_URL,
       protocol: CONFIG.BACKEND_URL.startsWith('https') ? 'HTTPS/WSS' : 'HTTP/WS',
       stats: { ...this.stats },

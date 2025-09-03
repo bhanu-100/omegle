@@ -308,14 +308,16 @@ class SocketHandler {
     return current > this.rateLimits.connection.maxAttempts;
   }
 
-  async registerConnection(socketId, metadata) {
+  async registerConnection(socketId) {
     try {
       await Promise.all([
-        connectionService.registerConnection(socketId, metadata),
+        connectionService.registerConnection(socketId),
         redisService.setHash(`user_session:${socketId}`, {
           socketId,
-          ...metadata,
-          worker: process.pid
+          worker: process.pid.toString(),
+          connectedAt: Date.now(),
+          lastActivity: Date.now(),
+          status: 'connected'
         }, 3600) // 1 hour TTL
       ]);
     } catch (error) {

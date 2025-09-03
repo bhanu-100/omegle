@@ -26,15 +26,15 @@ class ConnectionService {
         lastActivity: Date.now(),
         requestCount: 0
       });
-
+      // i handle direct this things but use in future
       // IMPROVED: Store in Redis with proper session data
-      await redisService.setHash(`user_session:${socketId}`, {
-        socketId,
-        worker: process.pid.toString(),
-        connectedAt: Date.now(),
-        lastActivity: Date.now(),
-        status: 'connected'
-      }, 3600); // 1 hour TTL
+      // await redisService.setHash(`user_session:${socketId}`, {
+      //   socketId,
+      //   worker: process.pid.toString(),
+      //   connectedAt: Date.now(),
+      //   lastActivity: Date.now(),
+      //   status: 'connected'
+      // }, 3600); // 1 hour TTL
 
       // OPTIMIZATION: Update metrics if available
       try {

@@ -2,6 +2,7 @@ const redisService = require('./redisService');
 const kafkaService = require('./kafkaService');
 const logger = require('../utils/logger');
 const metrics = require('../monitoring/metrics');
+const { error } = require('winston');
 
 class MatchmakingService {
   constructor() {
@@ -35,7 +36,6 @@ class MatchmakingService {
     let matchTimer = null;
     const socketId = socket.id;
     const lockKey = `match_lock:${socketId}`;
-    
     try {
       // Prevent duplicate match requests
       if (this.pendingMatches.has(socketId)) {
@@ -184,7 +184,8 @@ class MatchmakingService {
       );
 
       if (result && Array.isArray(result) && result.length >= 2) {
-        const [peerId, queueType] = result;
+        const [peer, queueType] = result;
+        const peerId = JSON.parse(peer).socketId;
         
         // Verify peer is still valid and get their preferences
         const peerSessionExists = await redisService.exists(`user_session:${peerId}`);
@@ -464,6 +465,9 @@ class MatchmakingService {
         const peerSocket = await this.findSocketById(io, peerId);
         if (peerSocket) {
           await peerSocket.join(roomId);
+        } else {
+          logger.warn('Peer socket not found for room join', { peerId, roomId });
+          throw new Error('Peer socket not found for room join');
         }
 
         // Notify both users
@@ -474,7 +478,7 @@ class MatchmakingService {
           matchQuality: matchData.matchQuality
         };
 
-        socket.emit('match_found', { ...baseMatchData, peerId });
+        await socket.emit('match_found', { ...baseMatchData, peerId });
         
         if (peerSocket) {
           peerSocket.emit('match_found', { ...baseMatchData, peerId: socketId });
@@ -537,7 +541,7 @@ class MatchmakingService {
   // OPTIMIZATION: More efficient socket finding
   async findSocketById(io, socketId) {
     try {
-      const socket = io.sockets.sockets.get(socketId);
+      const socket = await io.sockets.sockets.get(socketId);
       return socket && socket.connected ? socket : null;
     } catch (error) {
       logger.warn('Error finding socket by ID', { error: error.message, socketId });

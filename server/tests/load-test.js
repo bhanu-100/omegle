@@ -9,10 +9,10 @@ class LoadTester extends EventEmitter {
     super();
     
     this.serverUrl = options.serverUrl || 'http://localhost:3000';
-    this.maxConnections = options.maxConnections || 10;
-    this.concurrency = options.concurrency || 5;
+    this.maxConnections = options.maxConnections || 50;
+    this.concurrency = options.concurrency || 10;
     this.testDuration = options.testDuration || 60000; // 1 minute
-    this.rampUpTime = options.rampUpTime || 30000; // 30 seconds
+    this.rampUpTime = options.rampUpTime || 30000; // 300 seconds
     
     this.connections = [];
     this.stats = {
