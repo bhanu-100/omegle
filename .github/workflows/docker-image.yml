@@ -35,6 +35,7 @@ jobs:
           COMPOSE_DOCKER_CLI_BUILD: 1
           DOCKER_BUILDKIT: 1
         shell: /usr/bin/bash -e {0}
+        working-directory: ${{ github.workspace }}
       # 5. Push all Docker images using docker-compose
       - name: Push Docker images
         run: docker-compose -f docker-compose.prod.yml push
