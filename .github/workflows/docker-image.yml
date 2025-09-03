@@ -31,7 +31,7 @@ jobs:
         run: |
           IMAGE_TAG=bhanux100/server-webrtc-chat:latest
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          docker build -f Dockerfile -t $IMAGE_TAG .
+          docker build -f omegle/server/Dockerfile -t $IMAGE_TAG omegle/server
 
       # 5. Push Docker image
       - name: Push Docker image
