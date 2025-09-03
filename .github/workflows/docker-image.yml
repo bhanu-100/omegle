@@ -27,10 +27,11 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       # 4. Build all Docker images using docker-compose
+      # 4. Build all Docker images using docker-compose
       - name: Build Docker image
         run: |
           IMAGE_TAG=my-image-name:$(date +%s)
-          docker build -f server/Dockerfile -t $IMAGE_TAG server/
-
+          docker build -f server/Dockerfile -t $IMAGE_TAG .
+          
       - name: Push Docker image
         run: docker push $IMAGE_TAG
