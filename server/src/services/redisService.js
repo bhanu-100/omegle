@@ -495,6 +495,7 @@ class RedisService {
         user2,
         JSON.stringify(matchData)
       );
+      this.setMatch(user1,user2,matchData.roomId)
       return result === 1;
     } catch (error) {
       if (error.message.includes('NOSCRIPT')) {
