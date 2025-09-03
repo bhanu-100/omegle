@@ -28,11 +28,11 @@ jobs:
 
       # 4. Build and push Docker images using Docker Compose
       - name: Build and push Docker images
-        uses: docker/compose-action@v2
+        uses: docker/compose@v4
         with:
-          files: ./server/docker-compose.yml
+          compose-file: ./server/docker-compose.yml
           push: true
           build: true
-          options: --build-arg SOME_ARG=some_value
+          build-args: SOME_ARG=some_value
           # If you want to specify a particular service to build and push, uncomment the line below
           # services: your_service_name
