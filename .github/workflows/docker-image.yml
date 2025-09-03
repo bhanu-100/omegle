@@ -26,13 +26,13 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 4. Build and push Docker images using Docker Compose
-      - name: Build and push Docker images
-        uses: docker/compose@v4
-        with:
-          compose-file: ./server/docker-compose.yml
-          push: true
-          build: true
-          build-args: SOME_ARG=some_value
-          # If you want to specify a particular service to build and push, uncomment the line below
-          # services: your_service_name
+     # 4. Build all Docker images using docker-compose
+      - name: Build Docker image
+        id: build_and_tag
+        run: |
+          IMAGE_TAG=my-image-name:$(date +%s)
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          docker build -f server/Dockerfile -t $IMAGE_TAG .
+          
+      - name: Push Docker image
+        run: docker push ${{ env.IMAGE_TAG }}
