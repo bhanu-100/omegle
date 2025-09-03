@@ -28,8 +28,10 @@ jobs:
 
       # 4. Build all Docker images using docker-compose
       - name: Build Docker images
-        run: docker-compose -f server/docker-compose.yml build
+        working-directory: server
+        run: docker-compose build
 
       # 5. Push all Docker images
       - name: Push Docker images
-        run: docker-compose -f server/docker-compose.yml push
+        working-directory: server
+        run: docker-compose push
