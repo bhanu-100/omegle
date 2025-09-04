@@ -56,6 +56,9 @@ class WebRTCService {
   off(event, handler) {
     if (this.eventHandlers.has(event)) {
       this.eventHandlers.get(event).delete(handler);
+      if (this.eventHandlers.get(event).size === 0) {
+        this.eventHandlers.delete(event);
+      }
     }
   }
 
@@ -65,7 +68,7 @@ class WebRTCService {
         try {
           handler(data);
         } catch (error) {
-          dev.error('Event handler error:', error);
+          dev.error(`Event handler for '${event}' error:`, error);
         }
       });
     }
@@ -88,17 +91,13 @@ class WebRTCService {
       const mediaConstraints = constraints || mediaUtils.getOptimalConstraints();
       dev.log('Using media constraints:', mediaConstraints);
       
-      // Request user media
       const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
-      
       this.localStream = stream;
       
-      // Set up local video
       if (this.localVideoRef) {
         this.localVideoRef.srcObject = stream;
       }
       
-      // Set initial track states
       const audioTrack = stream.getAudioTracks()[0];
       const videoTrack = stream.getVideoTracks()[0];
       
@@ -169,7 +168,6 @@ class WebRTCService {
     performanceMonitor.start('peer-connection-init');
     
     try {
-      // Close existing connection
       if (this.peerConnection) {
         this.closePeerConnection();
       }
@@ -178,12 +176,16 @@ class WebRTCService {
       
       this.peerConnection = new RTCPeerConnection(CONFIG.ICE_SERVERS);
       
-      // Set up event handlers
+      // Attach all native WebRTC events
       this.peerConnection.addEventListener('icecandidate', this.handleIceCandidate);
       this.peerConnection.addEventListener('track', this.handleTrack);
       this.peerConnection.addEventListener('connectionstatechange', this.handleConnectionStateChange);
       this.peerConnection.addEventListener('iceconnectionstatechange', this.handleICEConnectionStateChange);
       this.peerConnection.addEventListener('icegatheringstatechange', this.handleICEGatheringStateChange);
+      this.peerConnection.addEventListener('signalingstatechange', () => {
+        dev.log('Signaling state changed:', this.peerConnection.signalingState);
+        this.emit('signaling_state_change', { state: this.peerConnection.signalingState });
+      });
       
       // Add local stream tracks if available
       if (this.localStream) {
@@ -314,10 +316,8 @@ class WebRTCService {
     dev.log(`Attempting connection recovery (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
     
     try {
-      // Wait before attempting recovery
       await new Promise(resolve => setTimeout(resolve, 1000 * this.reconnectAttempts));
       
-      // Try ICE restart first
       if (this.peerConnection && this.peerConnection.connectionState !== 'closed') {
         await this.restartIce();
       }
@@ -335,7 +335,7 @@ class WebRTCService {
 
   // Create and handle offers/answers
   async createOffer(options = {}) {
-    if (!this.peerConnection) {
+    if (this.isDestroyed || !this.peerConnection) {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
@@ -368,7 +368,7 @@ class WebRTCService {
   }
 
   async createAnswer(options = {}) {
-    if (!this.peerConnection) {
+    if (this.isDestroyed || !this.peerConnection) {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
@@ -395,7 +395,7 @@ class WebRTCService {
   }
 
   async setRemoteDescription(description) {
-    if (!this.peerConnection) {
+    if (this.isDestroyed || !this.peerConnection) {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
@@ -403,7 +403,6 @@ class WebRTCService {
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(description));
       dev.log('Remote description set:', description.type);
       
-      // Process queued ICE candidates
       await this.processQueuedICECandidates();
       
       this.emit('remote_description_set', { description });
@@ -420,7 +419,7 @@ class WebRTCService {
 
   // ICE candidate handling
   async addICECandidate(candidate) {
-    if (!this.peerConnection) {
+    if (this.isDestroyed || !this.peerConnection) {
       dev.warn('No peer connection available, queueing ICE candidate');
       this.iceCandidatesQueue.push(candidate);
       return;
@@ -438,7 +437,6 @@ class WebRTCService {
       
     } catch (error) {
       dev.warn('Failed to add ICE candidate:', error.message);
-      // Don't throw here, just log the warning
     }
   }
 
@@ -451,68 +449,72 @@ class WebRTCService {
     this.iceCandidatesQueue.length = 0;
     
     for (const candidate of candidates) {
-      await this.addICECandidate(candidate);
+      try {
+        await this.addICECandidate(candidate);
+      } catch (error) {
+        dev.error('Error adding queued ICE candidate:', error);
+      }
     }
   }
 
   // Media controls
   async toggleAudio(enabled) {
-    if (!this.localStream) {
+    if (this.isDestroyed || !this.localStream) {
       throw new AppError('No local stream available', 'WEBRTC');
     }
 
     const audioTrack = this.localStream.getAudioTracks()[0];
     if (!audioTrack) {
-      throw new AppError('No audio track available', 'WEBRTC');
+      dev.warn('No audio track available');
+      return false;
     }
-
-    audioTrack.enabled = enabled;
     
-    // Update sender if available
+    audioTrack.enabled = enabled;
+
     if (this.audioSender) {
       try {
         await this.audioSender.replaceTrack(enabled ? audioTrack : null);
+        dev.log('Audio toggled via sender:', enabled);
       } catch (error) {
         dev.warn('Failed to update audio sender:', error);
+        return false;
       }
     }
     
-    dev.log('Audio toggled:', enabled);
     this.emit('audio_toggled', { enabled, track: audioTrack });
-    
-    return enabled;
+    return true;
   }
 
   async toggleVideo(enabled) {
-    if (!this.localStream) {
+    if (this.isDestroyed || !this.localStream) {
       throw new AppError('No local stream available', 'WEBRTC');
     }
 
     const videoTrack = this.localStream.getVideoTracks()[0];
     if (!videoTrack) {
-      throw new AppError('No video track available', 'WEBRTC');
+      dev.warn('No video track available');
+      return false;
     }
-
-    videoTrack.enabled = enabled;
     
-    // Update sender if available
+    videoTrack.enabled = enabled;
+
     if (this.videoSender) {
       try {
         await this.videoSender.replaceTrack(enabled ? videoTrack : null);
+        dev.log('Video toggled via sender:', enabled);
       } catch (error) {
         dev.warn('Failed to update video sender:', error);
+        return false;
       }
     }
     
-    dev.log('Video toggled:', enabled);
     this.emit('video_toggled', { enabled, track: videoTrack });
-    
-    return enabled;
+    return true;
   }
 
   // Advanced features
   async restartIce() {
-    if (!this.peerConnection) {
+    if (this.isDestroyed || !this.peerConnection) {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
@@ -588,7 +590,6 @@ class WebRTCService {
           availableOutgoingBitrate: candidatePair?.availableOutgoingBitrate || 0
         };
         
-        // Calculate quality metrics
         const lossRate = newStats.packetsReceived > 0 
           ? newStats.packetsLost / (newStats.packetsLost + newStats.packetsReceived) 
           : 0;
@@ -625,7 +626,6 @@ class WebRTCService {
     this.localVideoRef = localVideoRef;
     this.remoteVideoRef = remoteVideoRef;
     
-    // Set current streams if available
     if (this.localStream && localVideoRef) {
       localVideoRef.srcObject = this.localStream;
     }
@@ -654,11 +654,13 @@ class WebRTCService {
     this.stopStatsCollection();
     
     if (this.peerConnection) {
+      // Remove all event listeners to prevent memory leaks
       this.peerConnection.removeEventListener('icecandidate', this.handleIceCandidate);
       this.peerConnection.removeEventListener('track', this.handleTrack);
       this.peerConnection.removeEventListener('connectionstatechange', this.handleConnectionStateChange);
       this.peerConnection.removeEventListener('iceconnectionstatechange', this.handleICEConnectionStateChange);
       this.peerConnection.removeEventListener('icegatheringstatechange', this.handleICEGatheringStateChange);
+      this.peerConnection.removeEventListener('signalingstatechange', () => {});
       
       this.peerConnection.close();
       this.peerConnection = null;
@@ -685,7 +687,6 @@ class WebRTCService {
     this.stopLocalStream();
     this.closePeerConnection();
     
-    // Reset stats
     this.stats = {
       packetsLost: 0,
       packetsReceived: 0,

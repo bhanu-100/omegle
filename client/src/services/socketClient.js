@@ -11,7 +11,6 @@ class SocketClient {
     this.connected = false;
     this.connecting = false;
     this.reconnectAttempt = 0;
-    this.listeners = new Map();
     this.emitQueue = [];
     this.pendingListeners = new Map(); // Store listeners that need to be attached when socket is ready
     this.stats = {
@@ -52,7 +51,7 @@ class SocketClient {
       });
 
       this.setupEventHandlers();
-      this.attachPendingListeners(); // Attach any listeners that were added before socket was ready
+      this.attachPendingListeners();
       performanceMonitor.end('socket-init');
       
       return this.socket;
@@ -66,7 +65,6 @@ class SocketClient {
     }
   }
 
-  // NEW METHOD: Attach pending listeners when socket is ready
   attachPendingListeners() {
     if (!this.socket || this.pendingListeners.size === 0) return;
     
@@ -74,17 +72,14 @@ class SocketClient {
     
     for (const [event, callbacks] of this.pendingListeners) {
       for (const callback of callbacks) {
-        if (!this.isInternalEvent(event)) {
-          this.socket.on(event, callback);
-          dev.log(`Attached pending listener for event: ${event}`);
-        }
+        this.socket.on(event, callback);
+        dev.log(`Attached pending listener for event: ${event}`);
       }
     }
     
     this.pendingListeners.clear();
   }
 
-  // NEW METHOD: Check if event is internal
   isInternalEvent(event) {
     return ['connect', 'disconnect', 'connect_error', 'reconnect_attempt', 'reconnect_failed', 'error', 'transport_upgrade', 'transport_upgrade_error'].includes(event);
   }
@@ -92,7 +87,6 @@ class SocketClient {
   setupEventHandlers() {
     if (!this.socket) return;
 
-    // Connection events
     this.socket.on('connect', this.handleConnect.bind(this));
     this.socket.on('disconnect', this.handleDisconnect.bind(this));
     this.socket.on('connect_error', this.handleConnectError.bind(this));
@@ -100,11 +94,9 @@ class SocketClient {
     this.socket.on('reconnect_failed', this.handleReconnectFailed.bind(this));
     this.socket.on('error', this.handleError.bind(this));
     
-    // Transport events
     this.socket.io.on('upgrade', this.handleUpgrade.bind(this));
     this.socket.io.on('upgradeError', this.handleUpgradeError.bind(this));
 
-    // Ping/Pong events for connection health
     this.socket.on('ping', () => dev.log('Ping from server'));
     this.socket.on('pong', (latency) => dev.log('Pong received, latency:', latency));
   }
@@ -125,10 +117,8 @@ class SocketClient {
     this.reconnectAttempt = 0;
     this.flushEmitQueue();
     
-    // Reattach any pending listeners after reconnection
     this.attachPendingListeners();
     
-    // Publish internal event
     this.eventEmitter.dispatchEvent(new CustomEvent('connect', { detail: { socketId: this.socket.id, transport } }));
   }
 
@@ -221,35 +211,37 @@ class SocketClient {
     this.eventEmitter.dispatchEvent(new CustomEvent('transport_upgrade_error', { detail: { error: error.message } }));
   }
 
-  // Connection management
   connect() {
     if (this.isDestroyed) {
       throw new AppError('Cannot connect destroyed socket', 'SOCKET');
     }
-
     if (!this.socket) {
       this.init();
     }
-
     if (this.connected || this.connecting) {
       dev.log('Already connected or connecting');
       return Promise.resolve();
     }
 
     return new Promise((resolve, reject) => {
+      let timeoutId;
       const onConnect = () => {
+        clearTimeout(timeoutId);
+        this.off('connect', onConnect);
+        this.off('connect_error', onError);
         resolve();
       };
-      
       const onError = (error) => {
+        clearTimeout(timeoutId);
+        this.off('connect', onConnect);
+        this.off('connect_error', onError);
         reject(error);
       };
-      
-      // Use once to avoid memory leaks
+
       this.once('connect', onConnect);
       this.once('connect_error', onError);
-
-      const timeout = setTimeout(() => {
+      
+      timeoutId = setTimeout(() => {
         this.off('connect', onConnect);
         this.off('connect_error', onError);
         reject(new AppError('Connection timeout', 'SOCKET_TIMEOUT'));
@@ -258,14 +250,6 @@ class SocketClient {
       this.connecting = true;
       dev.log('Initiating connection...');
       this.socket.connect();
-      
-      // Clear timeout when promise resolves
-      Promise.race([
-        new Promise(res => this.once('connect', res)),
-        new Promise((_, rej) => this.once('connect_error', rej))
-      ]).finally(() => {
-        clearTimeout(timeout);
-      });
     });
   }
 
@@ -285,15 +269,13 @@ class SocketClient {
     
     if (this.socket) {
       this.socket.removeAllListeners();
-      // Also remove listeners from the underlying manager
       this.socket.io.removeAllListeners();
       this.socket.disconnect();
       this.socket = null;
     }
     
     this.clearEmitQueue();
-    this.listeners.clear();
-    this.pendingListeners.clear(); // Clear pending listeners
+    this.pendingListeners.clear();
     this.connected = false;
     this.connecting = false;
   }
@@ -345,14 +327,12 @@ class SocketClient {
   }
 
   emit(event, data = null) {
-    // Return a promise for the caller
     return new Promise((resolve, reject) => {
       const timestamp = Date.now();
 
       if (this.connected && this.socket?.connected) {
         try {
           this.socket.emit(event, data, (ack) => {
-            // Optional: Handle server acknowledgments
             resolve(ack);
           });
           this.stats.messagesSent++;
@@ -397,22 +377,13 @@ class SocketClient {
     return false;
   }
 
-  // FIXED: Improved event listener handling
   on(event, callback) {
-    if (!this.listeners.has(event)) {
-      this.listeners.set(event, new Set());
-    }
-    this.listeners.get(event).add(callback);
-    
-    // For internal events, use EventTarget
     if (this.isInternalEvent(event)) {
       this.eventEmitter.addEventListener(event, callback);
-    } else if (this.socket) {
-      // If socket exists, attach immediately
+    } else if (this.socket && this.socket.connected) {
       this.socket.on(event, callback);
       dev.log(`Attached listener for event: ${event}`);
     } else {
-      // If socket doesn't exist yet, store for later
       if (!this.pendingListeners.has(event)) {
         this.pendingListeners.set(event, new Set());
       }
@@ -421,21 +392,18 @@ class SocketClient {
     }
   }
 
-  // FIXED: Improved event listener removal
   off(event, callback) {
-    if (this.listeners.has(event)) {
-      this.listeners.get(event).delete(callback);
-    }
-    
     if (this.isInternalEvent(event)) {
       this.eventEmitter.removeEventListener(event, callback);
     } else if (this.socket) {
       this.socket.off(event, callback);
     }
     
-    // Also remove from pending listeners
     if (this.pendingListeners.has(event)) {
       this.pendingListeners.get(event).delete(callback);
+      if (this.pendingListeners.get(event).size === 0) {
+        this.pendingListeners.delete(event);
+      }
     }
   }
 
@@ -521,7 +489,6 @@ class SocketClient {
   }
 }
 
-// Create singleton instance
 const socketClient = new SocketClient();
 
 const socketService = {
