@@ -43,6 +43,7 @@ class WebRTCService {
     this.handleConnectionStateChange = this.handleConnectionStateChange.bind(this);
     this.handleICEConnectionStateChange = this.handleICEConnectionStateChange.bind(this);
     this.handleICEGatheringStateChange = this.handleICEGatheringStateChange.bind(this);
+    this.handleSignalingStateChange = this.handleSignalingStateChange.bind(this);
   }
 
   // Event handling
@@ -158,7 +159,7 @@ class WebRTCService {
       throw appError;
     }
   }
-// ----------------------------------------------------------------------------------------------------------------------------------
+
   // Create and configure peer connection
   async createPeerConnection() {
     if (this.isDestroyed) {
@@ -182,10 +183,7 @@ class WebRTCService {
       this.peerConnection.addEventListener('connectionstatechange', this.handleConnectionStateChange);
       this.peerConnection.addEventListener('iceconnectionstatechange', this.handleICEConnectionStateChange);
       this.peerConnection.addEventListener('icegatheringstatechange', this.handleICEGatheringStateChange);
-      this.peerConnection.addEventListener('signalingstatechange', () => {
-        dev.log('Signaling state changed:', this.peerConnection.signalingState);
-        this.emit('signaling_state_change', { state: this.peerConnection.signalingState });
-      });
+      this.peerConnection.addEventListener('signalingstatechange', this.handleSignalingStateChange);
       
       // Add local stream tracks if available
       if (this.localStream) {
@@ -234,8 +232,9 @@ class WebRTCService {
     if (event.streams && event.streams[0]) {
       this.remoteStream = event.streams[0];
       
-      if (this.remoteVideoRef) {
-        this.remoteVideoRef.srcObject = event.streams[0];
+      if (this.remoteVideoRef && this.remoteVideoRef.srcObject !== this.remoteStream) {
+        this.remoteVideoRef.srcObject = this.remoteStream;
+        dev.log('Remote stream attached to video element');
       }
       
       this.emit('remote_stream', { 
@@ -249,7 +248,7 @@ class WebRTCService {
   handleConnectionStateChange() {
     const newState = this.peerConnection?.connectionState;
     const oldState = this.connectionState;
-    
+
     if (newState !== oldState) {
       this.connectionState = newState;
       dev.log('Connection state changed:', oldState, '->', newState);
@@ -259,6 +258,7 @@ class WebRTCService {
           this.stats.connectionTime = Date.now() - this.stats.timestamp;
           this.startStatsCollection();
           this.reconnectAttempts = 0;
+          this.emit('connected');
           break;
         case 'disconnected':
         case 'failed':
@@ -267,6 +267,7 @@ class WebRTCService {
           break;
         case 'closed':
           this.stopStatsCollection();
+          this.emit('closed');
           break;
       }
       
@@ -301,6 +302,11 @@ class WebRTCService {
     this.emit('ice_gathering_state_change', { state });
   }
 
+  handleSignalingStateChange() {
+    dev.log('Signaling state changed:', this.peerConnection?.signalingState);
+    this.emit('signaling_state_change', { state: this.peerConnection?.signalingState });
+  }
+
   // Handle connection failures with intelligent recovery
   async handleConnectionFailure() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
@@ -316,10 +322,12 @@ class WebRTCService {
     dev.log(`Attempting connection recovery (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
     
     try {
-      await new Promise(resolve => setTimeout(resolve, 1000 * this.reconnectAttempts));
+      const waitTime = Math.pow(2, this.reconnectAttempts) * 1000;
+      await new Promise(resolve => setTimeout(resolve, waitTime));
       
       if (this.peerConnection && this.peerConnection.connectionState !== 'closed') {
         await this.restartIce();
+        dev.log('ICE restart initiated for recovery.');
       }
       
       this.emit('connection_recovery_attempt', { attempt: this.reconnectAttempts });
@@ -400,12 +408,25 @@ class WebRTCService {
     }
 
     try {
-      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(description));
-      dev.log('Remote description set:', description.type);
+      // Use RTCSessionDescription to ensure the object is correct
+      const sdp = new RTCSessionDescription(description);
+      
+      dev.log(`Setting remote ${sdp.type} description...`);
+      
+      // Crucial state check to handle race conditions
+      if (sdp.type === 'answer' && this.peerConnection.signalingState !== 'have-local-offer') {
+          dev.warn('Cannot set remote answer, wrong state:', this.peerConnection.signalingState);
+          // If a race condition occurs, we close the connection and try to restart
+          this.closePeerConnection();
+          this.emit('signaling_error', new AppError(`Signaling race condition: Received answer in state ${this.peerConnection.signalingState}`, 'WEBRTC_RACE_CONDITION'));
+          throw new Error('Signaling state error');
+      }
+
+      await this.peerConnection.setRemoteDescription(sdp);
       
       await this.processQueuedICECandidates();
       
-      this.emit('remote_description_set', { description });
+      this.emit('remote_description_set', {description});
       
     } catch (error) {
       const appError = new AppError('Failed to set remote description', 'WEBRTC', {
@@ -626,11 +647,11 @@ class WebRTCService {
     this.localVideoRef = localVideoRef;
     this.remoteVideoRef = remoteVideoRef;
     
-    if (this.localStream && localVideoRef) {
+    if (this.localStream && localVideoRef && !localVideoRef.srcObject) {
       localVideoRef.srcObject = this.localStream;
     }
     
-    if (this.remoteStream && remoteVideoRef) {
+    if (this.remoteStream && remoteVideoRef && !remoteVideoRef.srcObject) {
       remoteVideoRef.srcObject = this.remoteStream;
     }
   }
@@ -660,7 +681,7 @@ class WebRTCService {
       this.peerConnection.removeEventListener('connectionstatechange', this.handleConnectionStateChange);
       this.peerConnection.removeEventListener('iceconnectionstatechange', this.handleICEConnectionStateChange);
       this.peerConnection.removeEventListener('icegatheringstatechange', this.handleICEGatheringStateChange);
-      this.peerConnection.removeEventListener('signalingstatechange', () => {});
+      this.peerConnection.removeEventListener('signalingstatechange', this.handleSignalingStateChange);
       
       this.peerConnection.close();
       this.peerConnection = null;

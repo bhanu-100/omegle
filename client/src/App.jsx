@@ -57,52 +57,48 @@ export default function App() {
     dev.error('App error:', err, context);
   }, []);
 
-  const initializeMedia = useCallback(async () => {
+  const startSession = useCallback(async () => {
     try {
+      webrtcService.cleanup();
+      setMessages([]);
+      setConnectionState(CONNECTION_STATES.WAITING);
+      
       setStatusMessage('Requesting camera and microphone access...');
       const stream = await webrtcService.initializeMedia();
       setMicEnabled(stream.getAudioTracks()[0]?.enabled || false);
       setCameraEnabled(stream.getVideoTracks()[0]?.enabled || false);
-      setStatusMessage('Media access granted');
-      return stream;
+      
+      setStatusMessage('Media access granted. Looking for a partner...');
+      socketService.emit('find_match');
+      
     } catch (err) {
-      handleError(err, 'initializeMedia');
-      throw err;
+      handleError(err, 'startSession');
+      webrtcService.cleanup();
+      setConnectionState(CONNECTION_STATES.ERROR);
     }
   }, [handleError]);
 
   const handleSkip = useCallback(() => {
-    webrtcService.cleanup();
-    setMessages([]);
-    setConnectionState(CONNECTION_STATES.WAITING);
-    setStatusMessage('Finding new partner...');
-    setMicEnabled(false);
-    setCameraEnabled(false);
-    socketService.emit('skip');
-    socketService.emit('find_match');
-  }, []);
+    addMessage(MESSAGE_TYPES.SYSTEM, 'Skipping to the next partner...');
+    startSession();
+  }, [addMessage, startSession]);
 
   const handleMatchFound = useCallback(async (data) => {
     try {
       performanceMonitor.start('match-setup');
       const { peerId } = data;
-      setConnectionState(CONNECTION_STATES.CONNECTED);
+      setConnectionState(CONNECTION_STATES.CONNECTING);
       setStatusMessage('Partner found! Setting up video...');
       setMessages([]);
       setError(null);
       
-      if (!webrtcService.service.localStream) {
-        await initializeMedia();
-      }
-      
       await webrtcService.createPeerConnection();
       
       const offer = await webrtcService.createOffer();
+      dev.log('Emitting WebRTC offer...');
       await socketService.emit('webrtc_offer', { sdp: offer });
-      dev.log('Setting up offer connection with:', offer);
       
       performanceMonitor.end('match-setup');
-      addMessage(MESSAGE_TYPES.SYSTEM, 'Connected to partner! Say hello!');
       dev.log('Matched with peer:', peerId);
       
       if (document.hidden) {
@@ -115,29 +111,41 @@ export default function App() {
       performanceMonitor.end('match-setup');
       handleError(err, 'handleMatchFound');
     }
-  }, [initializeMedia, addMessage, handleError]);
+  }, [addMessage, handleError]);
 
   const handleWebRTCOffer = useCallback(async ({ sdp }) => {
     try {
-      if (!webrtcService.service.localStream) {
-        await initializeMedia();
-      }
-      
+      dev.log('Received WebRTC offer. Creating peer connection...');
       if (!webrtcService.service.peerConnection) {
         await webrtcService.createPeerConnection();
       }
       
+      dev.log('Setting remote offer description...');
       await webrtcService.setRemoteDescription(sdp);
+
+      dev.log('Creating and setting local answer...');
       const answer = await webrtcService.createAnswer();
+      dev.log('Emitting WebRTC answer...');
       await socketService.emit('webrtc_answer', { sdp: answer });
+
     } catch (err) {
       handleError(err, 'handleWebRTCOffer');
     }
-  }, [initializeMedia, handleError]);
+  }, [handleError]);
 
   const handleWebRTCAnswer = useCallback(async ({ sdp }) => {
     try {
+      dev.log('Received WebRTC answer.');
+      // FIX: Check signaling state to prevent "Called in wrong state: stable" error
+      if (webrtcService.service.peerConnection?.signalingState !== 'have-local-offer') {
+        dev.warn('Received an answer in the wrong signaling state. Ignoring.');
+        // Don't throw an error here, simply ignore the late answer
+        return; 
+      }
+      
+      dev.log('Setting remote answer description...');
       await webrtcService.setRemoteDescription(sdp);
+      
     } catch (err) {
       handleError(err, 'handleWebRTCAnswer');
     }
@@ -145,6 +153,7 @@ export default function App() {
 
   const handleICECandidate = useCallback(async ({ candidate }) => {
     try {
+      dev.log('Received ICE candidate from signaling server...');
       if (candidate?.candidate) {
         await webrtcService.addICECandidate(candidate);
       }
@@ -157,15 +166,12 @@ export default function App() {
     setConnectionState(CONNECTION_STATES.WAITING);
     setStatusMessage('Partner left. Finding new partner...');
     addMessage(MESSAGE_TYPES.SYSTEM, 'Partner disconnected');
-    webrtcService.cleanup();
-    setMicEnabled(false);
-    setCameraEnabled(false);
     setTimeout(() => {
       if (socketService.connected) {
-        socketService.emit('find_match');
+        startSession();
       }
     }, 2000);
-  }, [addMessage]);
+  }, [addMessage, startSession]);
 
   const handleRateLimited = useCallback(() => {
     setConnectionState(CONNECTION_STATES.RATE_LIMITED);
@@ -176,10 +182,10 @@ export default function App() {
       if (socketService.connected) {
         setConnectionState(CONNECTION_STATES.WAITING);
         setError(null);
-        socketService.emit('find_match');
+        startSession();
       }
     }, 30000);
-  }, []);
+  }, [startSession]);
 
   const toggleMicrophone = useCallback(async () => {
     try {
@@ -234,13 +240,22 @@ export default function App() {
   // Set up all event handlers in separate useEffects for clarity
   useEffect(() => {
     webrtcService.setVideoRefs(localVideoRef.current, remoteVideoRef.current);
-  }, []);
+    
+    const onMediaInitialized = ({ stream }) => {
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+    };
 
-  useEffect(() => {
     const onRemoteStream = ({ stream }) => {
       dev.log('Remote stream received');
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = stream;
+      }
       setStatusMessage('Video connected!');
+      setConnectionState(CONNECTION_STATES.CONNECTED);
     };
+
     const onConnectionStateChange = ({ newState }) => {
       dev.log('WebRTC connection state:', newState);
       if (newState === 'connected') {
@@ -253,6 +268,7 @@ export default function App() {
     const onMediaError = (err) => handleError(err, 'webrtc_media_error');
     const onIceCandidate = ({ candidate }) => socketService.emit('webrtc_ice_candidate', { candidate });
     
+    webrtcService.on('media_initialized', onMediaInitialized);
     webrtcService.on('remote_stream', onRemoteStream);
     webrtcService.on('connection_state_change', onConnectionStateChange);
     webrtcService.on('stats_updated', onStatsUpdated);
@@ -260,6 +276,7 @@ export default function App() {
     webrtcService.on('ice_candidate', onIceCandidate);
     
     return () => {
+      webrtcService.off('media_initialized', onMediaInitialized);
       webrtcService.off('remote_stream', onRemoteStream);
       webrtcService.off('connection_state_change', onConnectionStateChange);
       webrtcService.off('stats_updated', onStatsUpdated);
@@ -282,7 +299,7 @@ export default function App() {
       setConnectionState(CONNECTION_STATES.WAITING);
       setStatusMessage('Looking for a chat partner...');
       setError(null);
-      socketService.emit('find_match');
+      startSession();
     };
     const onDisconnect = ({ reason }) => {
       dev.log('Socket disconnected:', reason);
@@ -319,7 +336,7 @@ export default function App() {
     ];
     
     return () => cleanups.forEach(off => off());
-  }, [handleError, addMessage, handlePeerDisconnected, handleMatchFound, handleWebRTCOffer, handleWebRTCAnswer, handleICECandidate, handleRateLimited]);
+  }, [handleError, addMessage, handlePeerDisconnected, handleMatchFound, handleWebRTCOffer, handleWebRTCAnswer, handleICECandidate, handleRateLimited, startSession]);
 
   useEffect(() => {
     const initializeApp = async () => {
