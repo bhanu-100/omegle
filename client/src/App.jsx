@@ -94,10 +94,10 @@ export default function App() {
  
 
   // WebRTC signaling handlers
-  const handleMatchFound = useCallback(async ({peerId}) => {
+  const handleMatchFound = useCallback(async (data) => {
     try {
       performanceMonitor.start('match-setup');
-      
+      const { peerId, ...baseMatchData } = data;
       setConnectionState(CONNECTION_STATES.CONNECTED);
       setStatusMessage('Partner found! Setting up video...');
       setMessages([]);

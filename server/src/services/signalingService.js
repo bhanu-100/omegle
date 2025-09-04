@@ -197,7 +197,7 @@ class SignalingService {
   async deliverSignalLocally(socketId, signalMessage) {
     try {
       // Get socket instance from the current server
-      const io = require('./socketHandler').getIO();
+      const io = require('../socket/socketHandler').getIO();
       const socket = io.sockets.sockets.get(socketId);
       
       if (!socket || !socket.connected) {
@@ -757,7 +757,7 @@ class SignalingService {
       }
       
       // Deliver signal locally
-      const io = require('./socketHandler').getIO();
+      const io = require('../socket/socketHandler').getIO();
       const socket = io.sockets.sockets.get(sessionData.socketId);
       
       if (socket && socket.connected) {
@@ -806,7 +806,7 @@ class SignalingService {
       }
       
       // Deliver message locally
-      const io = require('./socketHandler').getIO();
+      const io = require('../socket/socketHandler').getIO();
       const socket = io.sockets.sockets.get(sessionData.socketId);
       
       if (socket && socket.connected) {
