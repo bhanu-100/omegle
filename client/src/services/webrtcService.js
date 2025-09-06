@@ -1,5 +1,5 @@
 // =========================
-// Production WebRTC Service
+// Fixed WebRTC Service - Race Condition Handling
 // =========================
 
 import { CONFIG } from '../config';
@@ -19,6 +19,11 @@ class WebRTCService {
     this.iceCandidatesQueue = [];
     this.connectionState = 'new';
     this.iceConnectionState = 'new';
+    
+    // Race condition prevention
+    this.signalingState = 'stable';
+    this.pendingOperations = new Set();
+    this.operationLock = false;
     
     this.stats = {
       packetsLost: 0,
@@ -75,89 +80,105 @@ class WebRTCService {
     }
   }
 
+  // Operation locking to prevent race conditions
+  async withOperationLock(operation) {
+    if (this.operationLock) {
+      throw new AppError('Another WebRTC operation is in progress', 'WEBRTC_BUSY');
+    }
+
+    this.operationLock = true;
+    try {
+      return await operation();
+    } finally {
+      this.operationLock = false;
+    }
+  }
+
   // Initialize media devices
   async initializeMedia(constraints = null) {
     if (this.isDestroyed) {
       throw new AppError('WebRTC service is destroyed', 'WEBRTC');
     }
 
-    performanceMonitor.start('media-init');
-    
-    try {
-      // Check permissions first
-      const permissions = await mediaUtils.checkPermissions();
-      dev.log('Media permissions:', permissions);
+    return this.withOperationLock(async () => {
+      performanceMonitor.start('media-init');
       
-      // Use provided constraints or get optimal ones
-      const mediaConstraints = constraints || mediaUtils.getOptimalConstraints();
-      dev.log('Using media constraints:', mediaConstraints);
-      
-      const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
-      this.localStream = stream;
-      
-      if (this.localVideoRef) {
-        this.localVideoRef.srcObject = stream;
-      }
-      
-      const audioTrack = stream.getAudioTracks()[0];
-      const videoTrack = stream.getVideoTracks()[0];
-      
-      if (audioTrack) {
-        audioTrack.addEventListener('ended', () => {
-          dev.warn('Audio track ended');
-          this.emit('audio_track_ended');
+      try {
+        // Check permissions first
+        const permissions = await mediaUtils.checkPermissions();
+        dev.log('Media permissions:', permissions);
+        
+        // Use provided constraints or get optimal ones
+        const mediaConstraints = constraints || mediaUtils.getOptimalConstraints();
+        dev.log('Using media constraints:', mediaConstraints);
+        
+        const stream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+        this.localStream = stream;
+        
+        if (this.localVideoRef) {
+          this.localVideoRef.srcObject = stream;
+        }
+        
+        const audioTrack = stream.getAudioTracks()[0];
+        const videoTrack = stream.getVideoTracks()[0];
+        
+        if (audioTrack) {
+          audioTrack.addEventListener('ended', () => {
+            dev.warn('Audio track ended');
+            this.emit('audio_track_ended');
+          });
+        }
+        
+        if (videoTrack) {
+          videoTrack.addEventListener('ended', () => {
+            dev.warn('Video track ended');
+            this.emit('video_track_ended');
+          });
+        }
+        
+        performanceMonitor.end('media-init');
+        this.emit('media_initialized', { stream, audioTrack, videoTrack });
+        
+        return stream;
+        
+      } catch (error) {
+        performanceMonitor.end('media-init');
+        
+        let errorMessage = 'Failed to access camera/microphone';
+        let errorType = 'MEDIA_ACCESS';
+        
+        switch (error.name) {
+          case 'NotAllowedError':
+            errorMessage = 'Permission denied. Please allow camera and microphone access.';
+            errorType = 'PERMISSION';
+            break;
+          case 'NotFoundError':
+            errorMessage = 'No camera or microphone found.';
+            break;
+          case 'NotReadableError':
+            errorMessage = 'Camera/microphone is being used by another application.';
+            break;
+          case 'OverconstrainedError':
+            errorMessage = 'Camera/microphone constraints cannot be satisfied.';
+            break;
+          case 'SecurityError':
+            errorMessage = 'Media access blocked due to security restrictions.';
+            break;
+          case 'TypeError':
+            errorMessage = 'Invalid media constraints.';
+            break;
+        }
+        
+        const appError = new AppError(errorMessage, errorType, {
+          originalError: error.message,
+          name: error.name,
+          constraint: error.constraint
         });
+        
+        this.emit('media_error', appError);
+        throw appError;
       }
-      
-      if (videoTrack) {
-        videoTrack.addEventListener('ended', () => {
-          dev.warn('Video track ended');
-          this.emit('video_track_ended');
-        });
-      }
-      
-      performanceMonitor.end('media-init');
-      this.emit('media_initialized', { stream, audioTrack, videoTrack });
-      
-      return stream;
-      
-    } catch (error) {
-      performanceMonitor.end('media-init');
-      
-      let errorMessage = 'Failed to access camera/microphone';
-      let errorType = 'MEDIA_ACCESS';
-      
-      switch (error.name) {
-        case 'NotAllowedError':
-          errorMessage = 'Permission denied. Please allow camera and microphone access.';
-          errorType = 'PERMISSION';
-          break;
-        case 'NotFoundError':
-          errorMessage = 'No camera or microphone found.';
-          break;
-        case 'NotReadableError':
-          errorMessage = 'Camera/microphone is being used by another application.';
-          break;
-        case 'OverconstrainedError':
-          errorMessage = 'Camera/microphone constraints cannot be satisfied.';
-          break;
-        case 'SecurityError':
-          errorMessage = 'Media access blocked due to security restrictions.';
-          break;
-        case 'TypeError':
-          errorMessage = 'Invalid media constraints.';
-          break;
-      }
-      
-      const appError = new AppError(errorMessage, errorType, {
-        originalError: error.message,
-        name: error.name,
-        constraint: error.constraint
-      });
-      
-      this.emit('media_error', appError);
-      throw appError;
-    }
+    });
   }
 
   // Create and configure peer connection
@@ -166,52 +187,55 @@ class WebRTCService {
       throw new AppError('WebRTC service is destroyed', 'WEBRTC');
     }
 
-    performanceMonitor.start('peer-connection-init');
-    
-    try {
-      if (this.peerConnection) {
-        this.closePeerConnection();
-      }
-
-      dev.log('Creating peer connection with config:', CONFIG.ICE_SERVERS);
+    return this.withOperationLock(async () => {
+      performanceMonitor.start('peer-connection-init');
       
-      this.peerConnection = new RTCPeerConnection(CONFIG.ICE_SERVERS);
-      
-      // Attach all native WebRTC events
-      this.peerConnection.addEventListener('icecandidate', this.handleIceCandidate);
-      this.peerConnection.addEventListener('track', this.handleTrack);
-      this.peerConnection.addEventListener('connectionstatechange', this.handleConnectionStateChange);
-      this.peerConnection.addEventListener('iceconnectionstatechange', this.handleICEConnectionStateChange);
-      this.peerConnection.addEventListener('icegatheringstatechange', this.handleICEGatheringStateChange);
-      this.peerConnection.addEventListener('signalingstatechange', this.handleSignalingStateChange);
-      
-      // Add local stream tracks if available
-      if (this.localStream) {
-        for (const track of this.localStream.getTracks()) {
-          const sender = this.peerConnection.addTrack(track, this.localStream);
-          
-          if (track.kind === 'audio') {
-            this.audioSender = sender;
-          } else if (track.kind === 'video') {
-            this.videoSender = sender;
-          }
+      try {
+        if (this.peerConnection) {
+          this.closePeerConnection();
         }
-        dev.log('Added local tracks to peer connection');
+
+        dev.log('Creating peer connection with config:', CONFIG.ICE_SERVERS);
+        
+        this.peerConnection = new RTCPeerConnection(CONFIG.ICE_SERVERS);
+        this.signalingState = 'stable';
+        
+        // Attach all native WebRTC events
+        this.peerConnection.addEventListener('icecandidate', this.handleIceCandidate);
+        this.peerConnection.addEventListener('track', this.handleTrack);
+        this.peerConnection.addEventListener('connectionstatechange', this.handleConnectionStateChange);
+        this.peerConnection.addEventListener('iceconnectionstatechange', this.handleICEConnectionStateChange);
+        this.peerConnection.addEventListener('icegatheringstatechange', this.handleICEGatheringStateChange);
+        this.peerConnection.addEventListener('signalingstatechange', this.handleSignalingStateChange);
+        
+        // Add local stream tracks if available
+        if (this.localStream) {
+          for (const track of this.localStream.getTracks()) {
+            const sender = this.peerConnection.addTrack(track, this.localStream);
+            
+            if (track.kind === 'audio') {
+              this.audioSender = sender;
+            } else if (track.kind === 'video') {
+              this.videoSender = sender;
+            }
+          }
+          dev.log('Added local tracks to peer connection');
+        }
+        
+        performanceMonitor.end('peer-connection-init');
+        this.emit('peer_connection_created');
+        
+        return this.peerConnection;
+        
+      } catch (error) {
+        performanceMonitor.end('peer-connection-init');
+        const appError = new AppError('Failed to create peer connection', 'WEBRTC', {
+          originalError: error.message
+        });
+        this.emit('peer_connection_error', appError);
+        throw appError;
       }
-      
-      performanceMonitor.end('peer-connection-init');
-      this.emit('peer_connection_created');
-      
-      return this.peerConnection;
-      
-    } catch (error) {
-      performanceMonitor.end('peer-connection-init');
-      const appError = new AppError('Failed to create peer connection', 'WEBRTC', {
-        originalError: error.message
-      });
-      this.emit('peer_connection_error', appError);
-      throw appError;
-    }
+    });
   }
 
   // Event handlers
@@ -303,8 +327,10 @@ class WebRTCService {
   }
 
   handleSignalingStateChange() {
-    dev.log('Signaling state changed:', this.peerConnection?.signalingState);
-    this.emit('signaling_state_change', { state: this.peerConnection?.signalingState });
+    const newState = this.peerConnection?.signalingState;
+    dev.log('Signaling state changed:', this.signalingState, '->', newState);
+    this.signalingState = newState;
+    this.emit('signaling_state_change', { state: newState });
   }
 
   // Handle connection failures with intelligent recovery
@@ -341,38 +367,47 @@ class WebRTCService {
     }
   }
 
-  // Create and handle offers/answers
+  // Create and handle offers/answers with race condition protection
   async createOffer(options = {}) {
     if (this.isDestroyed || !this.peerConnection) {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
-    performanceMonitor.start('create-offer');
-    
-    try {
-      const defaultOptions = {
-        offerToReceiveAudio: true,
-        offerToReceiveVideo: true,
-        ...options
-      };
+    return this.withOperationLock(async () => {
+      performanceMonitor.start('create-offer');
       
-      const offer = await this.peerConnection.createOffer(defaultOptions);
-      await this.peerConnection.setLocalDescription(offer);
-      
-      dev.log('Offer created and set as local description');
-      performanceMonitor.end('create-offer');
-      
-      this.emit('offer_created', { offer });
-      return offer;
-      
-    } catch (error) {
-      performanceMonitor.end('create-offer');
-      const appError = new AppError('Failed to create offer', 'WEBRTC', {
-        originalError: error.message
-      });
-      this.emit('offer_error', appError);
-      throw appError;
-    }
+      try {
+        // Ensure we're in the correct state
+        if (this.signalingState !== 'stable') {
+          dev.warn(`Creating offer in state: ${this.signalingState}`);
+        }
+
+        const defaultOptions = {
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true,
+          ...options
+        };
+        
+        const offer = await this.peerConnection.createOffer(defaultOptions);
+        await this.peerConnection.setLocalDescription(offer);
+        this.signalingState = this.peerConnection.signalingState;
+        
+        dev.log('Offer created and set as local description');
+        performanceMonitor.end('create-offer');
+        
+        this.emit('offer_created', { offer });
+        return offer;
+        
+      } catch (error) {
+        performanceMonitor.end('create-offer');
+        const appError = new AppError('Failed to create offer', 'WEBRTC', {
+          originalError: error.message,
+          signalingState: this.signalingState
+        });
+        this.emit('offer_error', appError);
+        throw appError;
+      }
+    });
   }
 
   async createAnswer(options = {}) {
@@ -380,26 +415,35 @@ class WebRTCService {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
-    performanceMonitor.start('create-answer');
-    
-    try {
-      const answer = await this.peerConnection.createAnswer(options);
-      await this.peerConnection.setLocalDescription(answer);
+    return this.withOperationLock(async () => {
+      performanceMonitor.start('create-answer');
       
-      dev.log('Answer created and set as local description');
-      performanceMonitor.end('create-answer');
-      
-      this.emit('answer_created', { answer });
-      return answer;
-      
-    } catch (error) {
-      performanceMonitor.end('create-answer');
-      const appError = new AppError('Failed to create answer', 'WEBRTC', {
-        originalError: error.message
-      });
-      this.emit('answer_error', appError);
-      throw appError;
-    }
+      try {
+        // Ensure we have a remote offer first
+        if (this.signalingState !== 'have-remote-offer') {
+          throw new AppError(`Cannot create answer in state: ${this.signalingState}`, 'WEBRTC_INVALID_STATE');
+        }
+
+        const answer = await this.peerConnection.createAnswer(options);
+        await this.peerConnection.setLocalDescription(answer);
+        this.signalingState = this.peerConnection.signalingState;
+        
+        dev.log('Answer created and set as local description');
+        performanceMonitor.end('create-answer');
+        
+        this.emit('answer_created', { answer });
+        return answer;
+        
+      } catch (error) {
+        performanceMonitor.end('create-answer');
+        const appError = new AppError('Failed to create answer', 'WEBRTC', {
+          originalError: error.message,
+          signalingState: this.signalingState
+        });
+        this.emit('answer_error', appError);
+        throw appError;
+      }
+    });
   }
 
   async setRemoteDescription(description) {
@@ -407,38 +451,60 @@ class WebRTCService {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
-    try {
-      // Use RTCSessionDescription to ensure the object is correct
-      const sdp = new RTCSessionDescription(description);
-      
-      dev.log(`Setting remote ${sdp.type} description...`);
-      
-      // Crucial state check to handle race conditions
-      if (sdp.type === 'answer' && this.peerConnection.signalingState !== 'have-local-offer') {
-          dev.warn('Cannot set remote answer, wrong state:', this.peerConnection.signalingState);
-          // If a race condition occurs, we close the connection and try to restart
-          this.closePeerConnection();
-          this.emit('signaling_error', new AppError(`Signaling race condition: Received answer in state ${this.peerConnection.signalingState}`, 'WEBRTC_RACE_CONDITION'));
-          throw new Error('Signaling state error');
-      }
+    return this.withOperationLock(async () => {
+      try {
+        // Use RTCSessionDescription to ensure the object is correct
+        const sdp = new RTCSessionDescription(description);
+        
+        dev.log(`Setting remote ${sdp.type} description in state: ${this.signalingState}`);
+        
+        // Enhanced state validation with race condition handling
+        if (sdp.type === 'offer') {
+          if (this.signalingState !== 'stable') {
+            dev.warn(`Received offer in state ${this.signalingState}, resetting connection`);
+            // Reset to handle glare condition
+            await this.resetSignalingState();
+          }
+        } else if (sdp.type === 'answer') {
+          if (this.signalingState !== 'have-local-offer') {
+            dev.warn(`Received answer in invalid state: ${this.signalingState}`);
+            // This is a race condition - ignore this answer
+            return;
+          }
+        }
 
-      await this.peerConnection.setRemoteDescription(sdp);
-      
-      await this.processQueuedICECandidates();
-      
-      this.emit('remote_description_set', {description});
-      
-    } catch (error) {
-      const appError = new AppError('Failed to set remote description', 'WEBRTC', {
-        originalError: error.message,
-        description: description.type
-      });
-      this.emit('remote_description_error', appError);
-      throw appError;
+        await this.peerConnection.setRemoteDescription(sdp);
+        this.signalingState = this.peerConnection.signalingState;
+        
+        await this.processQueuedICECandidates();
+        
+        this.emit('remote_description_set', { description });
+        
+      } catch (error) {
+        const appError = new AppError('Failed to set remote description', 'WEBRTC', {
+          originalError: error.message,
+          description: description.type,
+          currentState: this.signalingState
+        });
+        this.emit('remote_description_error', appError);
+        throw appError;
+      }
+    });
+  }
+
+  // Reset signaling state to handle glare conditions
+  async resetSignalingState() {
+    dev.log('Resetting signaling state to handle glare condition');
+    
+    if (this.peerConnection) {
+      // Close current connection
+      this.closePeerConnection();
+      // Create new one
+      await this.createPeerConnection();
     }
   }
 
-  // ICE candidate handling
+  // ICE candidate handling with improved error handling
   async addICECandidate(candidate) {
     if (this.isDestroyed || !this.peerConnection) {
       dev.warn('No peer connection available, queueing ICE candidate');
@@ -453,10 +519,12 @@ class WebRTCService {
     }
 
     try {
-      await this.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      const iceCandidate = new RTCIceCandidate(candidate);
+      await this.peerConnection.addIceCandidate(iceCandidate);
       dev.log('ICE candidate added successfully');
       
     } catch (error) {
+      // Don't throw for ICE candidate errors - they're common and usually recoverable
       dev.warn('Failed to add ICE candidate:', error.message);
     }
   }
@@ -473,12 +541,12 @@ class WebRTCService {
       try {
         await this.addICECandidate(candidate);
       } catch (error) {
-        dev.error('Error adding queued ICE candidate:', error);
+        dev.warn('Error adding queued ICE candidate:', error);
       }
     }
   }
 
-  // Media controls
+  // Media controls with better error handling
   async toggleAudio(enabled) {
     if (this.isDestroyed || !this.localStream) {
       throw new AppError('No local stream available', 'WEBRTC');
@@ -492,7 +560,7 @@ class WebRTCService {
     
     audioTrack.enabled = enabled;
 
-    if (this.audioSender) {
+    if (this.audioSender && this.peerConnection) {
       try {
         await this.audioSender.replaceTrack(enabled ? audioTrack : null);
         dev.log('Audio toggled via sender:', enabled);
@@ -519,7 +587,7 @@ class WebRTCService {
     
     videoTrack.enabled = enabled;
 
-    if (this.videoSender) {
+    if (this.videoSender && this.peerConnection) {
       try {
         await this.videoSender.replaceTrack(enabled ? videoTrack : null);
         dev.log('Video toggled via sender:', enabled);
@@ -539,22 +607,25 @@ class WebRTCService {
       throw new AppError('No peer connection available', 'WEBRTC');
     }
 
-    try {
-      dev.log('Restarting ICE...');
-      
-      const offer = await this.peerConnection.createOffer({ iceRestart: true });
-      await this.peerConnection.setLocalDescription(offer);
-      
-      this.emit('ice_restart', { offer });
-      return offer;
-      
-    } catch (error) {
-      const appError = new AppError('Failed to restart ICE', 'WEBRTC', {
-        originalError: error.message
-      });
-      this.emit('ice_restart_error', appError);
-      throw appError;
-    }
+    return this.withOperationLock(async () => {
+      try {
+        dev.log('Restarting ICE...');
+        
+        const offer = await this.peerConnection.createOffer({ iceRestart: true });
+        await this.peerConnection.setLocalDescription(offer);
+        this.signalingState = this.peerConnection.signalingState;
+        
+        this.emit('ice_restart', { offer });
+        return offer;
+        
+      } catch (error) {
+        const appError = new AppError('Failed to restart ICE', 'WEBRTC', {
+          originalError: error.message
+        });
+        this.emit('ice_restart_error', appError);
+        throw appError;
+      }
+    });
   }
 
   // Statistics collection
@@ -656,7 +727,7 @@ class WebRTCService {
     }
   }
 
-  // Cleanup methods
+  // Enhanced cleanup methods
   stopLocalStream() {
     if (this.localStream) {
       this.localStream.getTracks().forEach(track => {
@@ -699,7 +770,9 @@ class WebRTCService {
     this.iceCandidatesQueue.length = 0;
     this.connectionState = 'new';
     this.iceConnectionState = 'new';
+    this.signalingState = 'stable';
     this.reconnectAttempts = 0;
+    this.operationLock = false;
   }
 
   cleanup() {
@@ -736,7 +809,7 @@ class WebRTCService {
       connection: this.connectionState,
       ice: this.iceConnectionState,
       gathering: this.peerConnection?.iceGatheringState || 'new',
-      signaling: this.peerConnection?.signalingState || 'stable'
+      signaling: this.signalingState
     };
   }
 
@@ -761,6 +834,7 @@ class WebRTCService {
       media: this.getMediaState(),
       queuedCandidates: this.iceCandidatesQueue.length,
       reconnectAttempts: this.reconnectAttempts,
+      operationLock: this.operationLock,
       isDestroyed: this.isDestroyed
     };
   }

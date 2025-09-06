@@ -34,6 +34,9 @@ export default function App() {
   const [showStats, setShowStats] = useState(CONFIG.FEATURES.enableStats);
   const [isInitializing, setIsInitializing] = useState(true);
 
+  // Socket event cleanup handlers
+  const socketCleanupRefs = useRef([]);
+
   // Memoized handlers to prevent unnecessary re-renders
   const addMessage = useCallback((sender, text, type = 'text') => {
     const message = messageUtils.createMessage(sender, text, type);
@@ -69,7 +72,7 @@ export default function App() {
       setCameraEnabled(stream.getVideoTracks()[0]?.enabled || false);
       
       setStatusMessage('Media access granted. Looking for a partner...');
-      socketService.emit('find_match');
+      await socketService.emit('find_match');
       
     } catch (err) {
       handleError(err, 'startSession');
@@ -82,6 +85,29 @@ export default function App() {
     addMessage(MESSAGE_TYPES.SYSTEM, 'Skipping to the next partner...');
     startSession();
   }, [addMessage, startSession]);
+
+  // Socket event handlers
+  const handleSocketConnected = useCallback(() => {
+    dev.log('Socket connected');
+    setIsReconnecting(false);
+    setConnectionState(CONNECTION_STATES.WAITING);
+    setStatusMessage('Looking for a chat partner...');
+    setError(null);
+    startSession();
+  }, [startSession]);
+
+  const handleSocketDisconnected = useCallback(({ reason }) => {
+    dev.log('Socket disconnected:', reason);
+    setConnectionState(CONNECTION_STATES.DISCONNECTED);
+    setStatusMessage('Connection lost. Reconnecting...');
+    setIsReconnecting(true);
+  }, []);
+
+  const handleSocketError = useCallback((err) => {
+    dev.error('Socket connection error:', err);
+    setConnectionState(CONNECTION_STATES.ERROR);
+    handleError(err, 'socket_error');
+  }, [handleError]);
 
   const handleMatchFound = useCallback(async (data) => {
     try {
@@ -111,7 +137,7 @@ export default function App() {
       performanceMonitor.end('match-setup');
       handleError(err, 'handleMatchFound');
     }
-  }, [addMessage, handleError]);
+  }, [handleError]);
 
   const handleWebRTCOffer = useCallback(async ({ sdp }) => {
     try {
@@ -136,10 +162,8 @@ export default function App() {
   const handleWebRTCAnswer = useCallback(async ({ sdp }) => {
     try {
       dev.log('Received WebRTC answer.');
-      // FIX: Check signaling state to prevent "Called in wrong state: stable" error
       if (webrtcService.service.peerConnection?.signalingState !== 'have-local-offer') {
         dev.warn('Received an answer in the wrong signaling state. Ignoring.');
-        // Don't throw an error here, simply ignore the late answer
         return; 
       }
       
@@ -173,19 +197,35 @@ export default function App() {
     }, 2000);
   }, [addMessage, startSession]);
 
-  const handleRateLimited = useCallback(() => {
+  const handleRateLimited = useCallback(({ type, message, retryAfter }) => {
     setConnectionState(CONNECTION_STATES.RATE_LIMITED);
-    setStatusMessage('Rate limited. Please wait before trying again...');
-    setError('You are sending requests too quickly. Please wait a moment.');
+    setStatusMessage(`Rate limited: ${message}`);
+    setError(message);
     
+    const waitTime = retryAfter || 30000;
     setTimeout(() => {
       if (socketService.connected) {
         setConnectionState(CONNECTION_STATES.WAITING);
         setError(null);
         startSession();
       }
-    }, 30000);
+    }, waitTime);
   }, [startSession]);
+
+  const handleMessage = useCallback((data) => {
+    if (data) addMessage(MESSAGE_TYPES.STRANGER, data);
+  }, [addMessage]);
+
+  const handleWaiting = useCallback(() => {
+    setConnectionState(CONNECTION_STATES.WAITING);
+    setStatusMessage('Waiting for partner...');
+  }, []);
+
+  const handleSignalingError = useCallback((err) => {
+    dev.error('Signaling error:', err);
+    setConnectionState(CONNECTION_STATES.ERROR);
+    handleError(new Error(err.message || 'Signaling error occurred'), 'signaling_error');
+  }, [handleError]);
 
   const toggleMicrophone = useCallback(async () => {
     try {
@@ -219,6 +259,7 @@ export default function App() {
 
   const sendMessage = useCallback(async () => {
     if (!inputMessage.trim() || connectionState !== CONNECTION_STATES.CONNECTED) return;
+    
     const sanitized = messageUtils.sanitizeMessage(inputMessage);
     if (!messageUtils.isValidMessage(sanitized)) {
       setError('Invalid message. Please check your input.');
@@ -228,7 +269,7 @@ export default function App() {
     try {
       const ack = await socketService.emit('message', sanitized);
       if (!ack || ack.error) {
-        throw new Error(ack?.error || 'user may be offline,try again');
+        throw new Error(ack?.error || 'Message failed to send');
       }
       addMessage(MESSAGE_TYPES.USER, sanitized);
       setInputMessage('');
@@ -237,7 +278,7 @@ export default function App() {
     }
   }, [inputMessage, connectionState, addMessage, handleError]);
 
-  // Set up all event handlers in separate useEffects for clarity
+  // Set up WebRTC event handlers
   useEffect(() => {
     webrtcService.setVideoRefs(localVideoRef.current, remoteVideoRef.current);
     
@@ -264,6 +305,7 @@ export default function App() {
         setStatusMessage('Connection lost. Trying to reconnect...');
       }
     };
+
     const onStatsUpdated = (stats) => setPerformanceStats(prev => ({ ...prev, ...stats }));
     const onMediaError = (err) => handleError(err, 'webrtc_media_error');
     const onIceCandidate = ({ candidate }) => socketService.emit('webrtc_ice_candidate', { candidate });
@@ -285,66 +327,58 @@ export default function App() {
     };
   }, [handleError]);
 
+  // Set up Socket event handlers - CENTRALIZED
   useEffect(() => {
-    const onMatchFound = (data) => {
-      dev.log('Match found:', data);
-      handleMatchFound(data);
-    };
-    const onMessage = (data) => {
-      if (data) addMessage(MESSAGE_TYPES.STRANGER, data);
-    };
-    const onConnect = () => {
-      dev.log('Socket connected');
-      setIsReconnecting(false);
-      setConnectionState(CONNECTION_STATES.WAITING);
-      setStatusMessage('Looking for a chat partner...');
-      setError(null);
-      startSession();
-    };
-    const onDisconnect = ({ reason }) => {
-      dev.log('Socket disconnected:', reason);
-      setConnectionState(CONNECTION_STATES.DISCONNECTED);
-      setStatusMessage('Connection lost. Reconnecting...');
-      setIsReconnecting(true);
-    };
-
+    // Register all socket event handlers using the centralized system
     const cleanups = [
-      socketService.on('match_found', onMatchFound),
+      socketService.on('connected', handleSocketConnected),
+      socketService.on('disconnect', handleSocketDisconnected),
+      socketService.on('error', handleSocketError),
+      socketService.on('match_found', handleMatchFound),
       socketService.on('webrtc_offer', handleWebRTCOffer),
       socketService.on('webrtc_answer', handleWebRTCAnswer),
       socketService.on('webrtc_ice_candidate', handleICECandidate),
       socketService.on('peer_disconnected', handlePeerDisconnected),
       socketService.on('match_cancelled', handlePeerDisconnected),
       socketService.on('rate_limited', handleRateLimited),
-      socketService.on('message', onMessage),
-      socketService.on('waiting', () => {
-        setConnectionState(CONNECTION_STATES.WAITING);
-        setStatusMessage('Waiting for partner...');
-      }),
-      socketService.on('connect', onConnect),
-      socketService.on('disconnect', onDisconnect),
-      socketService.on('error', (err) => {
-        dev.error('Socket connection error:', err);
-        setConnectionState(CONNECTION_STATES.ERROR);
-        handleError(err, 'socket_connect_error');
-      }),
-      socketService.on('signaling_error', (err) => {
-        dev.error('Signaling error:', err.error);
-        setConnectionState(CONNECTION_STATES.ERROR);
-        handleError(err, err.message);
-      }),
+      socketService.on('message', handleMessage),
+      socketService.on('waiting', handleWaiting),
+      socketService.on('signaling_error', handleSignalingError)
     ];
-    
-    return () => cleanups.forEach(off => off());
-  }, [handleError, addMessage, handlePeerDisconnected, handleMatchFound, handleWebRTCOffer, handleWebRTCAnswer, handleICECandidate, handleRateLimited, startSession]);
 
+    // Store cleanup functions for proper cleanup
+    socketCleanupRefs.current = cleanups;
+    
+    return () => {
+      // Clean up all socket event handlers
+      cleanups.forEach(cleanup => cleanup());
+      socketCleanupRefs.current = [];
+    };
+  }, [
+    handleSocketConnected,
+    handleSocketDisconnected, 
+    handleSocketError,
+    handleMatchFound,
+    handleWebRTCOffer,
+    handleWebRTCAnswer,
+    handleICECandidate,
+    handlePeerDisconnected,
+    handleRateLimited,
+    handleMessage,
+    handleWaiting,
+    handleSignalingError
+  ]);
+
+  // App initialization
   useEffect(() => {
     const initializeApp = async () => {
       try {
         performanceMonitor.start('app-init');
         setStatusMessage('Initializing application...');
+        
         await notifications.requestPermission();
         await socketService.connect();
+        
         performanceMonitor.end('app-init');
         setIsInitializing(false);
       } catch (err) {
@@ -353,13 +387,17 @@ export default function App() {
         setIsInitializing(false);
       }
     };
+
     initializeApp();
+
     return () => {
+      // Cleanup on unmount
       webrtcService.destroy();
       socketService.disconnect();
     };
   }, [handleError]);
 
+  // Keyboard shortcuts
   useEffect(() => {
     const handleKeyPress = (e) => {
       if (e.key === 'Enter' && e.target.tagName !== 'INPUT') {
@@ -405,6 +443,7 @@ export default function App() {
             </div>
           )}
         </header>
+        
         <div className="grid md:grid-cols-2 gap-6 mb-6">
           <div className="glass-card rounded-xl p-4">
             <h3 className="text-lg font-semibold mb-2 text-center text-green-400">You</h3>
@@ -423,6 +462,7 @@ export default function App() {
               </div>
             </div>
           </div>
+          
           <div className="glass-card rounded-xl p-4">
             <h3 className="text-lg font-semibold mb-2 text-center text-blue-400">Partner</h3>
             <div className="video-container">
@@ -445,6 +485,7 @@ export default function App() {
             </div>
           </div>
         </div>
+        
         <div className="flex justify-center gap-4 mb-6 flex-wrap">
           <button
             onClick={toggleMicrophone}
@@ -472,6 +513,7 @@ export default function App() {
             </button>
           )}
         </div>
+        
         <div className="grid lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2">
             <div className="glass-card rounded-xl p-4">
@@ -516,6 +558,7 @@ export default function App() {
               </div>
             </div>
           </div>
+          
           <div className="glass-card rounded-xl p-4">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold text-green-400">Connection Info</h3>
@@ -600,6 +643,7 @@ export default function App() {
             </div>
           </div>
         </div>
+        
         <footer className="text-center mt-8 text-gray-400 text-sm">
           <p>Press Enter to focus chat • Press Escape to skip • Ctrl+M for mic • Ctrl+V for camera</p>
           {CONFIG.FEATURES.debugMode && (
